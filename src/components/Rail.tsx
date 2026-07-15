@@ -62,6 +62,8 @@ export default function Rail() {
 
   const provider = getProvider(engineId);
   const ready = engineStatus === "ready";
+  const multiStep = !!provider.caps.multiStep;
+  const showSampler = showAdv || multiStep;
 
   return (
     <aside className="rail">
@@ -122,17 +124,24 @@ export default function Rail() {
             fmt={(v) => `${Math.round((1 - v) * 100)}% kept`}
           />
           <div className="hint">Lower ⇒ blends with existing pixels · Higher ⇒ reinvents the frame</div>
-          {showAdv && (
+          {showSampler && (
             <>
-              <Slider
-                label="Steps" value={params.steps} min={1} max={8} step={1}
-                onChange={(v) => setParams({ steps: v })}
-              />
-              <Slider
-                label="Guidance" value={params.guidance} min={0} max={8} step={0.1}
-                onChange={(v) => setParams({ guidance: v })}
-                fmt={(v) => v.toFixed(1)}
-              />
+              {multiStep ? (
+                <>
+                  <Slider
+                    label="Steps" value={params.steps} min={4} max={40} step={1}
+                    onChange={(v) => setParams({ steps: v })}
+                  />
+                  <Slider
+                    label="Guidance" value={params.guidance} min={1} max={12} step={0.1}
+                    onChange={(v) => setParams({ guidance: v })}
+                    fmt={(v) => v.toFixed(1)}
+                  />
+                  <div className="hint">More steps ⇒ finer detail (slower) · Guidance ⇒ how strictly it follows the prompt</div>
+                </>
+              ) : (
+                <div className="hint">SD-Turbo paints in a single step — steps &amp; guidance are fixed. Switch to SD 1.5 for multi-step control.</div>
+              )}
               <label className="slider">
                 <div className="slider-head">
                   <span className="eyebrow">Seed</span>
@@ -155,9 +164,11 @@ export default function Rail() {
               </label>
             </>
           )}
-          <button className="mini-toggle" onClick={() => setShowAdv((v) => !v)}>
-            {showAdv ? "− fewer controls" : "+ steps · guidance · seed"}
-          </button>
+          {!multiStep && (
+            <button className="mini-toggle" onClick={() => setShowAdv((v) => !v)}>
+              {showAdv ? "− fewer controls" : "+ steps · guidance · seed"}
+            </button>
+          )}
         </section>
       </div>
 
@@ -206,7 +217,7 @@ export default function Rail() {
           {engineStatus === "error" && <p className="engine-err">{engineError}</p>}
           {!ready && engineStatus !== "loading" && provider.caps.requiresLoad && (
             <button className="load-btn" onClick={() => loadEngine()}>
-              {provider.caps.local ? "Summon the model" : "Connect"}
+              {provider.caps.local ? "Download the model" : "Connect"}
             </button>
           )}
         </section>

@@ -161,7 +161,13 @@ export const useStore = create<AppState>((set, get) => ({
   engineId: persisted.engineId ?? "webgpu",
   setEngine: (id) =>
     set((s) => {
-      const next = { engineId: id, engineStatus: "idle" as const, engineError: null };
+      // Apply engine-appropriate sampler defaults so users don't have to tune
+      // steps/guidance by hand when switching between turbo and full SD.
+      const caps = getProvider(id).caps;
+      const params = caps.multiStep
+        ? { ...s.params, steps: caps.suggestedSteps ?? s.params.steps, guidance: caps.suggestedGuidance ?? s.params.guidance }
+        : { ...s.params, steps: 1, guidance: 1 };
+      const next = { engineId: id, engineStatus: "idle" as const, engineError: null, params };
       savePersisted({ ...s, ...next } as AppState);
       return next;
     }),
@@ -188,7 +194,7 @@ export const useStore = create<AppState>((set, get) => ({
     set({ engineStatus: "loading", engineError: null, progress: { phase: "downloading" } });
     try {
       const ok = await provider.isAvailable();
-      if (!ok && engineId === "webgpu") {
+      if (!ok && engineId.startsWith("webgpu")) {
         throw new Error(
           "This browser can't run WebGPU Stable Diffusion (needs Chrome/Edge 113+ with a shader-f16 GPU). Try the Atelier demo or a Remote WebUI.",
         );

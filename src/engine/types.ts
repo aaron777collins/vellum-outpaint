@@ -5,7 +5,7 @@
 // fully interchangeable.
 // ============================================================================
 
-export type ProviderId = "webgpu" | "remote" | "demo";
+export type ProviderId = "webgpu" | "webgpu-sd15" | "remote" | "demo";
 
 export interface SamplingParams {
   prompt: string;
@@ -66,6 +66,11 @@ export interface ProviderCapabilities {
   /** Human label + one-line description for the engine picker. */
   label: string;
   blurb: string;
+  /** Runs a real multi-step sampler with classifier-free guidance (non-turbo). */
+  multiStep?: boolean;
+  /** Sensible defaults applied when the user picks this engine. */
+  suggestedSteps?: number;
+  suggestedGuidance?: number;
 }
 
 export interface DiffusionProvider {
