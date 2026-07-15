@@ -1,0 +1,165 @@
+/* ============================================================================
+   VELLUM — design system
+   Illuminated-manuscript meets modern creative tool.
+   Warm charcoal · gilded amber · grain. Fraunces / Hanken Grotesk / JetBrains Mono.
+   ========================================================================== */
+
+:root {
+  /* --- ink & vellum --------------------------------------------------- */
+  --void: #0a0908;
+  --char-900: #100e0c;
+  --char-850: #14110f;
+  --char-800: #191512;
+  --char-750: #201b17;
+  --char-700: #2a231d;
+  --char-600: #38302a;
+  --line: #2e2721;
+  --line-soft: #241f1a;
+
+  /* --- gild (accent) -------------------------------------------------- */
+  --gild: #e9c46a;
+  --gild-bright: #f4d98b;
+  --gild-deep: #c8963e;
+  --gild-ink: #7a5a26;
+  --gild-glow: rgba(233, 196, 106, 0.16);
+
+  /* --- ivory (text) --------------------------------------------------- */
+  --ivory: #f3ecdd;
+  --parch: #d8cdb6;
+  --parch-dim: #a89c86;
+  --parch-faint: #6f6558;
+
+  /* --- signal --------------------------------------------------------- */
+  --rubric: #c56a52;      /* rubric red — masks / destructive */
+  --verd: #7fa06a;        /* success */
+  --azure: #6f92b8;       /* info / links */
+
+  /* --- type ----------------------------------------------------------- */
+  --serif: "Fraunces Variable", "Fraunces", Georgia, serif;
+  --sans: "Hanken Grotesk Variable", "Hanken Grotesk", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+
+  /* --- structure ------------------------------------------------------ */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 16px;
+  --rail: 336px;
+  --topbar: 56px;
+  --toolbar: 60px;
+
+  --shadow-lift: 0 1px 0 rgba(255, 240, 210, 0.04) inset,
+    0 12px 32px -12px rgba(0, 0, 0, 0.7);
+  --shadow-deep: 0 24px 60px -20px rgba(0, 0, 0, 0.85);
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+
+  color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root { height: 100%; }
+
+body {
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ivory);
+  background: var(--void);
+  overflow: hidden;
+  overscroll-behavior: none;
+  font-feature-settings: "ss01", "cv05";
+}
+
+/* film grain over the whole app */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0.04;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+::selection { background: var(--gild-glow); color: var(--gild-bright); }
+
+/* --- typographic primitives ------------------------------------------ */
+.display {
+  font-family: var(--serif);
+  font-optical-sizing: auto;
+  font-weight: 340;
+  letter-spacing: -0.02em;
+  line-height: 1.02;
+}
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--parch-dim);
+}
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* --- scrollbars ------------------------------------------------------- */
+* { scrollbar-width: thin; scrollbar-color: var(--char-600) transparent; }
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-thumb {
+  background: var(--char-600);
+  border-radius: 20px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--char-700); }
+
+/* --- form controls --------------------------------------------------- */
+button { font: inherit; color: inherit; cursor: pointer; background: none; border: none; }
+input, textarea, select { font: inherit; color: inherit; }
+input:focus-visible, textarea:focus-visible, button:focus-visible {
+  outline: 1px solid var(--gild);
+  outline-offset: 1px;
+}
+
+/* range slider — gilded */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 2px;
+  background: var(--char-700);
+  border-radius: 2px;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--gild);
+  border: 2px solid var(--char-850);
+  box-shadow: 0 0 0 1px var(--gild-deep), 0 2px 6px rgba(0, 0, 0, 0.6);
+  transition: transform 0.12s var(--ease);
+}
+input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.18); }
+input[type="range"]::-moz-range-thumb {
+  width: 13px; height: 13px; border-radius: 50%;
+  background: var(--gild); border: 2px solid var(--char-850);
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes glowpulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}

@@ -1,0 +1,20 @@
+services:
+  outpaint:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: outpaint
+    restart: unless-stopped
+    # No host port publish — the central Caddy container reaches this
+    # service directly over the shared `caddy` Docker network by name.
+    expose:
+      - "80"
+    networks:
+      - caddy
+
+networks:
+  # Pre-existing network owned by the central Caddy stack
+  # (/home/ubuntu/webstack/caddy). We only attach to it here, we don't
+  # create or manage it.
+  caddy:
+    external: true

@@ -1,0 +1,4 @@
+# [NO SSO] Vellum — in-browser outpainting studio
+outpaint.aaroncollins.info {
+	reverse_proxy outpaint:80
+}
