@@ -286,6 +286,31 @@ export class WebGpuProvider implements DiffusionProvider {
     return `vellum-${this.id}`;
   }
 
+  // Ask the browser to mark our storage bucket persistent. The multi-GB model
+  // cache lives in the Cache API, which by default is "best-effort" storage and
+  // gets EVICTED under disk pressure — that made the weights re-download on
+  // every visit. Persistent storage is exempt from automatic eviction, so the
+  // one-time download actually stays one-time. No-op if already granted or if
+  // the API is unavailable (older browsers / insecure context).
+  private async requestPersistence(onProgress: (p: EngineProgress) => void): Promise<void> {
+    try {
+      const storage = navigator.storage;
+      if (!storage?.persist) return;
+      if (await storage.persisted?.()) return; // already persistent — nothing to do
+      const granted = await storage.persist();
+      if (!granted) {
+        // Chrome auto-decides based on site engagement; a denial just means the
+        // cache remains evictable. Surface it so a re-download isn't a mystery.
+        onProgress({
+          phase: "downloading",
+          detail: "note: browser did not grant persistent storage — cached models may be evicted later",
+        });
+      }
+    } catch {
+      /* storage API unavailable — proceed without persistence */
+    }
+  }
+
   private async makeSession(
     url: string,
     label: string,
@@ -305,6 +330,11 @@ export class WebGpuProvider implements DiffusionProvider {
         "WebGPU with shader-f16 is not available in this browser. Try Chrome/Edge 113+ on a discrete GPU, or use another engine.",
       );
     }
+    // Mark storage persistent BEFORE downloading so the ~2.5 GB we're about to
+    // cache survives across sessions instead of being evicted (root cause of the
+    // "re-downloads every time" bug).
+    await this.requestPersistence(onProgress);
+
     const m = this.manifest;
     const url = (p: string) => `${m.base}/${p}`;
     const L = m.latent;
