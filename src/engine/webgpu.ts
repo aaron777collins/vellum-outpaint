@@ -81,7 +81,7 @@ export const DEFAULT_MANIFEST = TURBO_MANIFEST;
 
 const SIGMA_MAX = 14.6146;
 const VAE_SCALE = 0.18215;
-const TURBO_TIMESTEP = 999n;
+const TURBO_TIMESTEP = 999;
 const NUM_TRAIN = 1000;
 const BETA_START = 0.00085;
 const BETA_END = 0.012;
@@ -171,6 +171,28 @@ function trainSigmas(): Float32Array {
   return s;
 }
 
+// Per-session tensor metadata: input/output NAMES plus their declared DTYPES.
+// The two weight repos DISAGREE on I/O precision, so we cannot assume fp16:
+//   • SD-Turbo (schmuell): unet/vae_decoder take fp32 I/O; timestep is int64;
+//     vae_encoder is genuinely fp16.
+//   • SD 1.5 (nmkd):       unet is fully fp16 — including an fp16 timestep.
+// We read each model's real dtypes at load and build/read tensors to match,
+// converting from a canonical Float32Array. Feeding fp16 into an fp32 input
+// (the previous hardcoded assumption) errored out every single generation.
+interface SessMeta {
+  inNames: readonly string[];
+  outNames: readonly string[];
+  in: Record<string, string>; // input  name -> Tensor.Type ("float16" | "float32" | "int64" | ...)
+  out: Record<string, string>; // output name -> Tensor.Type
+}
+function readSessMeta(s: ort.InferenceSession): SessMeta {
+  const inT: Record<string, string> = {};
+  const outT: Record<string, string> = {};
+  for (const m of s.inputMetadata) if ((m as any).isTensor) inT[m.name] = String((m as any).type);
+  for (const m of s.outputMetadata) if ((m as any).isTensor) outT[m.name] = String((m as any).type);
+  return { inNames: s.inputNames, outNames: s.outputNames, in: inT, out: outT };
+}
+
 // Pick `steps` discrete timesteps (high noise -> low) plus a trailing sigma=0.
 function buildSchedule(steps: number): { sigmas: number[]; ts: number[] } {
   const table = trainSigmas();
@@ -199,7 +221,7 @@ export class WebGpuProvider implements DiffusionProvider {
   } = {};
   private tokenizer: any = null;
   private loaded = false;
-  private names: Record<string, { in: readonly string[]; out: readonly string[] }> = {};
+  private meta: Record<string, SessMeta> = {};
 
   constructor(
     id: ProviderId = "webgpu",
@@ -346,6 +368,15 @@ export class WebGpuProvider implements DiffusionProvider {
       extra: { session: { disable_prepacking: "1" } },
     };
 
+    // UNet free-dim overrides. The two repos name their symbolic dims
+    // differently (turbo: batch_size/num_channels/sequence_length; SD 1.5:
+    // batch/channels/sequence), so we supply BOTH — unknown keys are ignored,
+    // and this keeps SD 1.5's shapes static instead of dynamic.
+    const unetDims = {
+      batch_size: 1, num_channels: 4, height: L, width: L, sequence_length: 77,
+      batch: 1, channels: 4, sequence: 77,
+    };
+
     // Tokenizer (small; pulled from HF by transformers.js).
     onProgress({ phase: "downloading", detail: "tokenizer", fraction: 0.01 });
     const { AutoTokenizer } = await import("@huggingface/transformers");
@@ -364,9 +395,7 @@ export class WebGpuProvider implements DiffusionProvider {
       onProgress({ phase: "compiling", detail: "unet" });
       this.sessions.unet = await ort.InferenceSession.create(graphBuf, {
         ...common,
-        freeDimensionOverrides: {
-          batch_size: 1, num_channels: 4, height: L, width: L, sequence_length: 77,
-        },
+        freeDimensionOverrides: unetDims,
         externalData: [
           // The graph references the .pb by its basename.
           { path: m.unetWeights.split("/").pop()!, data: new Uint8Array(weightsBuf) },
@@ -375,9 +404,7 @@ export class WebGpuProvider implements DiffusionProvider {
     } else {
       this.sessions.unet = await this.makeSession(url(m.unet), "unet", {
         ...common,
-        freeDimensionOverrides: {
-          batch_size: 1, num_channels: 4, height: L, width: L, sequence_length: 77,
-        },
+        freeDimensionOverrides: unetDims,
       }, onProgress);
     }
 
@@ -397,11 +424,11 @@ export class WebGpuProvider implements DiffusionProvider {
       },
     }, onProgress);
 
-    this.names = {
-      text: { in: this.sessions.text.inputNames, out: this.sessions.text.outputNames },
-      unet: { in: this.sessions.unet.inputNames, out: this.sessions.unet.outputNames },
-      vaeDec: { in: this.sessions.vaeDec.inputNames, out: this.sessions.vaeDec.outputNames },
-      vaeEnc: { in: this.sessions.vaeEnc.inputNames, out: this.sessions.vaeEnc.outputNames },
+    this.meta = {
+      text: readSessMeta(this.sessions.text),
+      unet: readSessMeta(this.sessions.unet),
+      vaeDec: readSessMeta(this.sessions.vaeDec),
+      vaeEnc: readSessMeta(this.sessions.vaeEnc),
     };
 
     this.loaded = true;
@@ -414,8 +441,37 @@ export class WebGpuProvider implements DiffusionProvider {
     this.loaded = false;
   }
 
+  // ------------------------------------------------------ dtype-aware tensors
+  // Build an ORT tensor for input `name` of session `key`, converting canonical
+  // Float32 data into whatever precision the model actually declares.
+  private makeFloatInput(key: string, name: string, f32: Float32Array, dims: readonly number[]): ort.Tensor {
+    const t = this.meta[key].in[name];
+    const d = dims as number[];
+    if (t === "float16") return new ort.Tensor("float16", packF16(f32), d);
+    if (t === "float32") return new ort.Tensor("float32", f32, d);
+    throw new Error(`Unexpected float input dtype "${t}" for ${key}.${name}`);
+  }
+
+  // Build the timestep/sigma scalar in the unet's declared type — int64 for
+  // SD-Turbo, fp16 for SD 1.5, etc.
+  private makeStep(key: string, name: string, value: number): ort.Tensor {
+    const t = this.meta[key].in[name];
+    if (t === "int64") return new ort.Tensor("int64", BigInt64Array.from([BigInt(Math.round(value))]), [1]);
+    if (t === "int32") return new ort.Tensor("int32", Int32Array.from([Math.round(value)]), [1]);
+    if (t === "float16") return new ort.Tensor("float16", packF16(Float32Array.from([value])), [1]);
+    if (t === "float32") return new ort.Tensor("float32", Float32Array.from([value]), [1]);
+    throw new Error(`Unexpected timestep dtype "${t}" for ${key}.${name}`);
+  }
+
+  // Read any float output tensor back to a canonical Float32Array.
+  private readFloatOutput(t: ort.Tensor): Float32Array {
+    if (t.type === "float16") return unpackF16(t.data as Uint16Array);
+    if (t.type === "float32") return t.data as Float32Array;
+    throw new Error(`Unexpected output dtype "${t.type}"`);
+  }
+
   // ------------------------------------------------------------------ encode
-  private async encodeText(prompt: string): Promise<ort.Tensor> {
+  private async encodeText(prompt: string): Promise<{ data: Float32Array; dims: readonly number[] }> {
     const enc = await this.tokenizer(prompt, {
       padding: "max_length",
       max_length: 77,
@@ -424,14 +480,19 @@ export class WebGpuProvider implements DiffusionProvider {
     });
     const ids = (enc.input_ids as number[]).slice(0, 77);
     while (ids.length < 77) ids.push(0);
-    const input = new ort.Tensor("int32", Int32Array.from(ids), [1, 77]);
-    const inName = this.names.text.in[0];
+    const inName = this.meta.text.inNames[0];
+    const input = this.meta.text.in[inName] === "int64"
+      ? new ort.Tensor("int64", BigInt64Array.from(ids.map((v) => BigInt(v))), [1, 77])
+      : new ort.Tensor("int32", Int32Array.from(ids), [1, 77]);
     const res = await this.sessions.text!.run({ [inName]: input });
-    return res[this.names.text.out[0]] as ort.Tensor;
+    const out = res[this.meta.text.outNames[0]] as ort.Tensor;
+    // Return canonical float32; the unet builds its own hidden tensor in the
+    // precision IT wants (fp32 for turbo, fp16 for SD 1.5).
+    return { data: this.readFloatOutput(out), dims: out.dims };
   }
 
   private async vaeEncode(img: ImageData, L: number): Promise<Float32Array> {
-    // pixels -> [1,3,H,W] in [-1,1], fp16
+    // pixels -> [1,3,H,W] in [-1,1]; makeFloatInput casts to the model's dtype
     const size = L * 8;
     const scaled = resizeImageData(img, size, size);
     const chw = new Float32Array(3 * size * size);
@@ -441,49 +502,44 @@ export class WebGpuProvider implements DiffusionProvider {
       chw[size * size + i] = d[p + 1] / 127.5 - 1;
       chw[2 * size * size + i] = d[p + 2] / 127.5 - 1;
     }
-    const t = new ort.Tensor("float16", packF16(chw), [1, 3, size, size]);
-    const inName = this.names.vaeEnc.in[0];
+    const inName = this.meta.vaeEnc.inNames[0];
+    const t = this.makeFloatInput("vaeEnc", inName, chw, [1, 3, size, size]);
     const res = await this.sessions.vaeEnc!.run({ [inName]: t });
-    const out = res[this.names.vaeEnc.out[0]] as ort.Tensor;
-    const latent = unpackF16(out.data as Uint16Array);
+    const out = res[this.meta.vaeEnc.outNames[0]] as ort.Tensor;
+    const latent = this.readFloatOutput(out);
     for (let i = 0; i < latent.length; i++) latent[i] *= VAE_SCALE;
     return latent; // [1,4,L,L] flattened
   }
 
   // Run the unet once and return the predicted noise (eps) for a pre-scaled
-  // latent. `scaled` is already x / sqrt(sigma^2+1).
+  // latent. `scaled` is already x / sqrt(sigma^2+1). `hidden` is canonical fp32.
   private async runUnet(
     scaled: Float32Array,
-    timestep: bigint,
-    hidden: ort.Tensor,
+    timestep: number,
+    hidden: { data: Float32Array; dims: readonly number[] },
     L: number,
   ): Promise<Float32Array> {
-    const sample = new ort.Tensor("float16", packF16(scaled), [1, 4, L, L]);
-    const ts = new ort.Tensor("int64", BigInt64Array.from([timestep]), [1]);
     const feeds: Record<string, ort.Tensor> = {};
-    const inNames = this.names.unet.in;
+    const inNames = this.meta.unet.inNames;
     for (const n of inNames) {
       const ln = n.toLowerCase();
-      if (ln.includes("sample")) feeds[n] = sample;
-      else if (ln.includes("timestep") || ln === "t") feeds[n] = ts;
-      else if (ln.includes("hidden") || ln.includes("encoder")) feeds[n] = hidden;
-    }
-    if (!Object.keys(feeds).length && inNames.length >= 3) {
-      feeds[inNames[0]] = sample; feeds[inNames[1]] = ts; feeds[inNames[2]] = hidden;
+      if (ln.includes("sample")) feeds[n] = this.makeFloatInput("unet", n, scaled, [1, 4, L, L]);
+      else if (ln.includes("timestep") || ln === "t") feeds[n] = this.makeStep("unet", n, timestep);
+      else if (ln.includes("hidden") || ln.includes("encoder")) feeds[n] = this.makeFloatInput("unet", n, hidden.data, hidden.dims);
     }
     const res = await this.sessions.unet!.run(feeds);
-    return unpackF16(res[this.names.unet.out[0]].data as Uint16Array);
+    return this.readFloatOutput(res[this.meta.unet.outNames[0]] as ort.Tensor);
   }
 
   private async vaeDecode(latent: Float32Array, L: number): Promise<ImageData> {
     const inp = new Float32Array(latent.length);
     for (let i = 0; i < latent.length; i++) inp[i] = latent[i] / VAE_SCALE;
-    const t = new ort.Tensor("float16", packF16(inp), [1, 4, L, L]);
-    const inName = this.names.vaeDec.in[0];
+    const inName = this.meta.vaeDec.inNames[0];
+    const t = this.makeFloatInput("vaeDec", inName, inp, [1, 4, L, L]);
     const res = await this.sessions.vaeDec!.run({ [inName]: t });
-    const out = res[this.names.vaeDec.out[0]] as ort.Tensor;
+    const out = res[this.meta.vaeDec.outNames[0]] as ort.Tensor;
     const size = L * 8;
-    const chw = unpackF16(out.data as Uint16Array);
+    const chw = this.readFloatOutput(out);
     const img = new ImageData(size, size);
     const pl = size * size;
     for (let i = 0, p = 0; i < pl; i++, p += 4) {
@@ -573,7 +629,7 @@ export class WebGpuProvider implements DiffusionProvider {
         const cin = 1 / Math.sqrt(sigma * sigma + 1);
         const scaled = new Float32Array(latent.length);
         for (let k = 0; k < latent.length; k++) scaled[k] = latent[k] * cin;
-        const tstep = BigInt(ts[i]);
+        const tstep = ts[i];
         const epsCond = await this.runUnet(scaled, tstep, hidden, L);
         let eps = epsCond;
         if (useCfg && uncond) {
@@ -595,9 +651,6 @@ export class WebGpuProvider implements DiffusionProvider {
       }
       finalLatent = latent;
     }
-
-    (hidden as any).dispose?.();
-    (uncond as any)?.dispose?.();
 
     check();
     onProgress({ phase: "decoding", fraction: 0.9 });
