@@ -3,6 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vellum.svg" />
+    <link rel="apple-touch-icon" href="/vellum.svg" />
+    <!-- Installable PWA. Being installable makes Chrome grant persistent storage,
+         which exempts the ~2.5 GB model cache from best-effort eviction (the cause
+         of "re-downloads on every refresh"). -->
+    <link rel="manifest" href="/manifest.webmanifest" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <meta name="theme-color" content="#0c0b0a" />
     <meta

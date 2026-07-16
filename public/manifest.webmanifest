@@ -1,0 +1,18 @@
+{
+  "name": "Vellum — outpainting studio",
+  "short_name": "Vellum",
+  "description": "In-browser outpainting studio. Stable Diffusion runs on your own GPU via WebGPU — nothing leaves your machine.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0a0908",
+  "theme_color": "#0c0b0a",
+  "icons": [
+    {
+      "src": "/vellum.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

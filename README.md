@@ -32,6 +32,8 @@ first load it works **fully offline**, and nothing you paint is ever uploaded, l
 anyone but you.
 
 - 🎨 **Infinite canvas** — pan, zoom, and frame any region to extend. Outpaint in every direction.
+- 🖼️ **Stamp your own photos** — drop, paste, or import an image, then drag & scale it onto the
+  canvas and outpaint around it. The natural starting point for extending a real photograph.
 - 🔒 **Truly private** — no server, no account, no telemetry. It's a static site plus your browser.
 - ⚡ **Two engines, one click** — pick instant single-step **SD-Turbo** or the classic, fully
   controllable **SD 1.5**.
@@ -40,7 +42,8 @@ anyone but you.
 - 🌐 **Bring your own backend (optional)** — point it at a local Automatic1111 / ComfyUI server if
   you'd rather run those weights.
 - 💾 **Cached weights** — models are stored in the browser Cache API, so the multi-GB download
-  happens only once.
+  happens only once. **Install Vellum** (address-bar install icon) so the browser grants
+  *persistent* storage and the cache is never evicted — see [Persistent weights](#persistent-weights).
 
 ## Engines
 
@@ -95,6 +98,32 @@ frame pixels ─▶ VAE encoder ─┘                                          
   *fidelity* control, denoises, then feather-composites the result so new and old pixels blend.
 - **UI state** is a single [Zustand](https://github.com/pmndrs/zustand) store; the canvas, engines,
   and remote backend all sit behind one `DiffusionProvider` interface.
+
+## Placing photos
+
+The **Stamp** tool is the quickest way to start from a real image:
+
+1. Click **Stamp a photo** in the right rail (or the ❖ tool, or **Import**) — or just **drag an
+   image onto the canvas**, or **paste** one with ⌘/Ctrl-V.
+2. The photo floats on the canvas. **Drag** to position, drag a **corner** to scale (aspect-locked),
+   **Flip** to mirror, or **Fit to frame** to snap it into the current outpaint window.
+3. Press **Place** (⏎) to commit it — or **Cancel** (Esc) to discard.
+
+Once placed, move the frame past the photo's edge and **Outpaint** to extend it.
+
+## Persistent weights
+
+The engines cache ~2.5 GB of model weights in the browser Cache API, so the download is a one-time
+cost. That cache survives page reloads — **but** browsers keep it as *best-effort* storage by
+default, and Chrome only exempts an origin from eviction (`navigator.storage.persist()`) once the
+site is **installed, bookmarked, or has enough engagement**. On a brand-new visit that grant is
+usually declined, so under disk pressure the browser can reclaim the cache and the weights
+re-download on a later visit.
+
+Vellum requests persistence on every load and ships an installable PWA manifest to earn the grant;
+if the browser still declines, it tells you so (and how to fix it) instead of silently
+re-downloading. **The reliable fix: install Vellum** (the install icon in the address bar, or ⋮ →
+*Install*) — installed origins get persistent storage, and the cache then sticks forever.
 
 ## Deployment
 

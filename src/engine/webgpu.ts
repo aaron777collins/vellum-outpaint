@@ -35,6 +35,18 @@ import { GenerationAbortError } from "./types";
 const ORT_VERSION = "1.27.0";
 ort.env.wasm.wasmPaths = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
 ort.env.wasm.numThreads = 1;
+// Ask ORT (and thus the WebGPU adapter request) for the HIGH-PERFORMANCE GPU.
+// On hybrid-GPU laptops WebGPU otherwise defaults to the integrated GPU, whose
+// fp16 support is often flaky / memory-starved — a prime suspect for the "works
+// the first time, then the frame is black" report (the algorithm itself is
+// verified correct on CPU end-to-end). This selects the discrete GPU instead.
+try {
+  (ort.env as unknown as { webgpu?: { powerPreference?: string } }).webgpu ??= {};
+  (ort.env as unknown as { webgpu: { powerPreference?: string } }).webgpu.powerPreference =
+    "high-performance";
+} catch {
+  /* older ort without env.webgpu — harmless */
+}
 
 // --- model manifest (runtime-overridable so URLs can be corrected in-app) ----
 export interface ModelManifest {
@@ -247,7 +259,10 @@ export class WebGpuProvider implements DiffusionProvider {
     const gpu = (navigator as any).gpu;
     if (!gpu) return false;
     try {
-      const adapter = await gpu.requestAdapter();
+      // Prefer the discrete GPU (see powerPreference note at module top).
+      const adapter =
+        (await gpu.requestAdapter({ powerPreference: "high-performance" })) ??
+        (await gpu.requestAdapter());
       if (!adapter) return false;
       // fp16 weights need the shader-f16 GPU feature.
       return adapter.features?.has?.("shader-f16") ?? false;
@@ -264,23 +279,38 @@ export class WebGpuProvider implements DiffusionProvider {
   // Teeing the body lets us report byte progress while the browser writes the
   // other branch straight to disk — avoiding the multi-GB triple-buffering that
   // previously OOM-crashed the tab ("this page can't be reached").
+  //
+  // "RE-DOWNLOADS EVERY REFRESH" ROOT CAUSE (diagnosed 2026-07-16, with a real
+  // headless-Chromium reproduction): it is NOT a cache-key/Vary problem — a
+  // bare-URL `cache.match` (even for the streamed tee() put above) is verified to
+  // survive a full browser-context close+reopen. The real cause is EVICTION:
+  // `navigator.storage.persist()` returns false on a fresh, low-engagement origin
+  // (confirmed in-browser), which leaves the ~2.5 GB weight cache as *best-effort*
+  // storage — and the browser reclaims best-effort storage under disk pressure,
+  // so on the next visit the entry is simply gone. The durable fix lives in
+  // `requestPersistence()` + the PWA manifest (installable / bookmarked / engaged
+  // origins get persistence GRANTED, which exempts the cache from eviction); when
+  // the browser still declines, we surface that plainly so a re-download is an
+  // understood state, not a mystery. `{ ignoreVary: true }` below is kept purely
+  // as cheap defensiveness against any future header-bearing cache key.
   private async fetchCached(
     url: string,
     onProgress: (p: EngineProgress) => void,
     label: string,
   ): Promise<ArrayBuffer> {
     const cache = await caches.open(this.cacheName());
-    let hit = await cache.match(url);
+    const MATCH = { ignoreVary: true, ignoreSearch: true } as const;
+    let hit = await cache.match(url, MATCH);
     if (!hit) {
       const resp = await fetch(url);
       if (!resp.ok) throw new Error(`Download failed: ${label} (${resp.status})`);
       const total = Number(resp.headers.get("content-length")) || 0;
+      // Store under a clean synthetic response: no Vary, no cross-origin headers,
+      // just the length so progress works on a later cached read.
+      const cacheHeaders = total ? { "content-length": String(total) } : undefined;
       if (resp.body) {
         const [toCache, toCount] = resp.body.tee();
-        const put = cache.put(
-          url,
-          new Response(toCache, total ? { headers: { "content-length": String(total) } } : undefined),
-        );
+        const put = cache.put(url, new Response(toCache, cacheHeaders ? { headers: cacheHeaders } : undefined));
         const reader = toCount.getReader();
         let received = 0;
         for (;;) {
@@ -296,10 +326,18 @@ export class WebGpuProvider implements DiffusionProvider {
         await put;
       } else {
         const buf = await resp.arrayBuffer();
-        await cache.put(url, new Response(buf));
+        await cache.put(url, new Response(buf, cacheHeaders ? { headers: cacheHeaders } : undefined));
       }
-      hit = await cache.match(url);
-      if (!hit) throw new Error(`Could not cache ${label}.`);
+      hit = await cache.match(url, MATCH);
+      // Extremely defensive: if the store silently didn't land (private-mode
+      // quota, etc.), fall back to a direct fetch so the load still succeeds
+      // this session rather than hard-failing.
+      if (!hit) {
+        onProgress({ phase: "downloading", detail: `${label} · caching unavailable, using direct download` });
+        const direct = await fetch(url);
+        if (!direct.ok) throw new Error(`Could not cache or fetch ${label} (${direct.status}).`);
+        return direct.arrayBuffer();
+      }
     }
     return hit.arrayBuffer();
   }
@@ -441,6 +479,14 @@ export class WebGpuProvider implements DiffusionProvider {
     this.loaded = false;
   }
 
+  // Tear down and rebuild every session. Weights come from the Cache API, so no
+  // re-download happens — this just re-creates the ONNX sessions (and the WebGPU
+  // device), used to recover from a GPU that started returning empty frames.
+  private async reloadSessions(onProgress: (p: EngineProgress) => void): Promise<void> {
+    await this.dispose();
+    await this.load(onProgress);
+  }
+
   // ------------------------------------------------------ dtype-aware tensors
   // Build an ORT tensor for input `name` of session `key`, converting canonical
   // Float32 data into whatever precision the model actually declares.
@@ -463,11 +509,17 @@ export class WebGpuProvider implements DiffusionProvider {
     throw new Error(`Unexpected timestep dtype "${t}" for ${key}.${name}`);
   }
 
-  // Read any float output tensor back to a canonical Float32Array.
+  // Read any float output tensor back to a canonical Float32Array, then release
+  // the source tensor's GPU/CPU buffer. We COPY on the float32 path (`.slice()`)
+  // so the returned array stays valid after dispose — never hand back a view into
+  // a buffer we're about to free.
   private readFloatOutput(t: ort.Tensor): Float32Array {
-    if (t.type === "float16") return unpackF16(t.data as Uint16Array);
-    if (t.type === "float32") return t.data as Float32Array;
-    throw new Error(`Unexpected output dtype "${t.type}"`);
+    let out: Float32Array;
+    if (t.type === "float16") out = unpackF16(t.data as Uint16Array);
+    else if (t.type === "float32") out = (t.data as Float32Array).slice();
+    else throw new Error(`Unexpected output dtype "${t.type}"`);
+    (t as unknown as { dispose?: () => void }).dispose?.();
+    return out;
   }
 
   // ------------------------------------------------------------------ encode
@@ -486,9 +538,11 @@ export class WebGpuProvider implements DiffusionProvider {
       : new ort.Tensor("int32", Int32Array.from(ids), [1, 77]);
     const res = await this.sessions.text!.run({ [inName]: input });
     const out = res[this.meta.text.outNames[0]] as ort.Tensor;
-    // Return canonical float32; the unet builds its own hidden tensor in the
-    // precision IT wants (fp32 for turbo, fp16 for SD 1.5).
-    return { data: this.readFloatOutput(out), dims: out.dims };
+    // Capture dims BEFORE readFloatOutput (which disposes the tensor). Return
+    // canonical float32; the unet builds its own hidden tensor in the precision
+    // IT wants (fp32 for turbo, fp16 for SD 1.5).
+    const dims = out.dims;
+    return { data: this.readFloatOutput(out), dims };
   }
 
   private async vaeEncode(img: ImageData, L: number): Promise<Float32Array> {
@@ -556,6 +610,7 @@ export class WebGpuProvider implements DiffusionProvider {
     req: GenerateRequest,
     onProgress: (p: EngineProgress) => void,
     signal?: AbortSignal,
+    _retry = false,
   ): Promise<GenerateResult> {
     if (!this.loaded) throw new Error("WebGPU engine not loaded.");
     const t0 = performance.now();
@@ -656,6 +711,27 @@ export class WebGpuProvider implements DiffusionProvider {
     onProgress({ phase: "decoding", fraction: 0.9 });
     const decoded = await this.vaeDecode(finalLatent, L);
 
+    // WebGPU safety net. Our CPU reference (txt2img → img2img → img2img) proves
+    // the pipeline is numerically correct, so an all-black / flat frame here is a
+    // GPU-execution failure (device lost, VRAM exhaustion, or a low-power GPU
+    // that only survived one run) — the "works the first time, then black" bug.
+    // Recover ONCE by rebuilding the sessions (weights are cached, so this is
+    // fast and re-initializes the GPU device), then fail loudly rather than
+    // silently committing a black tile to the canvas.
+    if (isDegenerateFrame(decoded)) {
+      if (!_retry) {
+        onProgress({ phase: "compiling", detail: "GPU returned an empty frame — reinitializing…" });
+        await this.reloadSessions(onProgress);
+        return this.generate(req, onProgress, signal, true);
+      }
+      throw new Error(
+        "The GPU returned an empty (black) frame. This is almost always the browser " +
+          "using a low-power/integrated GPU or running out of video memory — not your " +
+          "prompt. Try: reload the page, close other GPU-heavy tabs, switch to the SD 1.5 " +
+          "or Remote engine, or use a machine with a discrete GPU.",
+      );
+    }
+
     const outAtReq = resizeImageData(decoded, req.width, req.height);
     let image = outAtReq;
     if (req.initImage) {
@@ -683,4 +759,27 @@ function resizeImageData(img: ImageData, w: number, h: number): ImageData {
 }
 function clamp255(v: number): number {
   return v < 0 ? 0 : v > 255 ? 255 : v;
+}
+
+// True when a decoded frame is degenerate (uniform / all-black) — the signature
+// of a failed WebGPU decode. A real image, even a dark one, has large luminance
+// variance (hundreds+); a failed decode is essentially flat, so a near-zero
+// variance is an unambiguous "the GPU gave us nothing" signal. Sampled (~4k px)
+// so it stays cheap on large frames.
+function isDegenerateFrame(img: ImageData): boolean {
+  const d = img.data;
+  let sum = 0;
+  let sum2 = 0;
+  let n = 0;
+  const stride = 4 * Math.max(1, Math.floor(d.length / 4 / 4096));
+  for (let p = 0; p + 2 < d.length; p += stride) {
+    const l = 0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2];
+    sum += l;
+    sum2 += l * l;
+    n++;
+  }
+  if (n === 0) return false;
+  const mean = sum / n;
+  const variance = sum2 / n - mean * mean;
+  return variance < 2;
 }

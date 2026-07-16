@@ -243,6 +243,28 @@ export function roundTo(n: number, m: number): number {
   return Math.max(m, Math.round(n / m) * m);
 }
 
+/** Open the OS file picker and resolve the chosen image File (or null). */
+export function pickImageFile(): Promise<File | null> {
+  return new Promise((res) => {
+    const inp = document.createElement("input");
+    inp.type = "file";
+    inp.accept = "image/*";
+    inp.style.display = "none";
+    let settled = false;
+    const done = (f: File | null) => {
+      if (settled) return;
+      settled = true;
+      inp.remove();
+      res(f);
+    };
+    inp.onchange = () => done(inp.files?.[0] ?? null);
+    // `cancel` fires in modern browsers when the dialog is dismissed.
+    inp.addEventListener("cancel", () => done(null));
+    document.body.appendChild(inp);
+    inp.click();
+  });
+}
+
 /** Load a File/Blob/URL into ImageData. */
 export async function loadImageData(src: Blob | string): Promise<ImageData> {
   const url = typeof src === "string" ? src : URL.createObjectURL(src);

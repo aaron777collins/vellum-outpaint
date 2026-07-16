@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { doc, type Rect } from "./lib/document";
+import { ctxOf, imageDataToCanvas, loadImageData, makeCanvas } from "./lib/imaging";
 import {
   ALL_PROVIDERS,
   getProvider,
@@ -10,7 +11,25 @@ import {
 } from "./engine";
 import { GenerationAbortError } from "./engine/types";
 
-export type Tool = "pan" | "frame" | "move";
+export type Tool = "pan" | "frame" | "move" | "stamp";
+
+/**
+ * A photo being interactively placed onto the canvas. It floats above the world
+ * — movable and scalable — until the user commits it (Place) or cancels. This is
+ * the "stamp" tool: import a photo, position/scale it, drop it in, then outpaint
+ * around it. `x,y,w,h` are WORLD coordinates (same space as the frame). The
+ * source pixels are kept at natural resolution so scaling stays crisp.
+ */
+export interface Stamp {
+  img: ImageData;
+  natW: number;
+  natH: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  flipH: boolean;
+}
 
 export interface ViewState {
   x: number; // world coord at screen center
@@ -79,6 +98,16 @@ interface AppState {
   loadPct: number;
   generate: () => Promise<void>;
   cancel: () => void;
+
+  // stamp (interactive photo placement)
+  stamp: Stamp | null;
+  stampFromFile: (file: File | Blob) => Promise<void>;
+  beginStamp: (img: ImageData) => void;
+  updateStamp: (p: Partial<Stamp>) => void;
+  flipStamp: () => void;
+  fitStampToFrame: () => void;
+  commitStamp: () => void;
+  cancelStamp: () => void;
 
   // doc
   docRev: number;
@@ -204,6 +233,23 @@ export const useStore = create<AppState>((set, get) => ({
       );
       set({ engineStatus: "ready", progress: { phase: "done" } });
       get().toast("success", `${provider.caps.label} ready`);
+      // Local engines cache ~2.5 GB of weights. If the browser refused persistent
+      // storage, that cache is best-effort and can be evicted — which is exactly
+      // what makes the models re-download on a later visit. Tell the user plainly
+      // (once) how to make it permanent instead of leaving it a mystery.
+      if (engineId.startsWith("webgpu")) {
+        try {
+          const persisted = await navigator.storage?.persisted?.();
+          if (persisted === false) {
+            get().toast(
+              "info",
+              "Your browser hasn't made the model cache permanent, so it may re-download later. Install Vellum (address-bar ⊕ / ⋮ → Install) or bookmark it to keep the weights forever.",
+            );
+          }
+        } catch {
+          /* storage API unavailable */
+        }
+      }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       set({ engineStatus: "error", engineError: msg, progress: { phase: "error" } });
@@ -260,6 +306,79 @@ export const useStore = create<AppState>((set, get) => ({
   cancel: () => {
     abortCtrl?.abort();
   },
+
+  // ---- stamp: interactive photo placement -------------------------------
+  stamp: null,
+  stampFromFile: async (file) => {
+    try {
+      const img = await loadImageData(file);
+      get().beginStamp(img);
+    } catch {
+      get().toast("error", "Could not read that image");
+    }
+  },
+  beginStamp: (img) =>
+    set((s) => {
+      const natW = img.width;
+      const natH = img.height;
+      // Fit the longest side to ~512 world units by default (matches the tile
+      // scale) so big photos arrive at a sane, editable size. Small images keep
+      // their native size. Centered on the current viewport center.
+      const longest = Math.max(natW, natH);
+      const scale = longest > 512 ? 512 / longest : 1;
+      const w = Math.max(1, Math.round(natW * scale));
+      const h = Math.max(1, Math.round(natH * scale));
+      return {
+        tool: "stamp" as const,
+        stamp: {
+          img, natW, natH, flipH: false,
+          x: Math.round(s.view.x - w / 2),
+          y: Math.round(s.view.y - h / 2),
+          w, h,
+        },
+      };
+    }),
+  updateStamp: (p) => set((s) => (s.stamp ? { stamp: { ...s.stamp, ...p } } : {})),
+  flipStamp: () => set((s) => (s.stamp ? { stamp: { ...s.stamp, flipH: !s.stamp.flipH } } : {})),
+  fitStampToFrame: () =>
+    set((s) => {
+      if (!s.stamp) return {};
+      const f = s.frame;
+      const aspect = s.stamp.natW / s.stamp.natH;
+      // contain within the frame while preserving aspect
+      let w = f.w;
+      let h = w / aspect;
+      if (h > f.h) { h = f.h; w = h * aspect; }
+      w = Math.round(w);
+      h = Math.round(h);
+      return {
+        stamp: {
+          ...s.stamp, w, h,
+          x: Math.round(f.x + (f.w - w) / 2),
+          y: Math.round(f.y + (f.h - h) / 2),
+        },
+      };
+    }),
+  commitStamp: () =>
+    set((s) => {
+      const st = s.stamp;
+      if (!st) return {};
+      const w = Math.max(1, Math.round(st.w));
+      const h = Math.max(1, Math.round(st.h));
+      // Render the (optionally flipped) photo to its world-pixel size, then paint
+      // it into the document at the stamp's world rect.
+      const c = makeCanvas(w, h);
+      const ctx = ctxOf(c);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      if (st.flipH) { ctx.translate(w, 0); ctx.scale(-1, 1); }
+      ctx.drawImage(imageDataToCanvas(st.img), 0, 0, w, h);
+      const img = ctx.getImageData(0, 0, w, h);
+      doc.commit({ x: st.x, y: st.y, w, h }, img);
+      setTimeout(() => get().toast("success", "Photo placed — move the frame past its edge to outpaint"), 0);
+      return { stamp: null, tool: "frame" as const, docRev: doc.revision };
+    }),
+  cancelStamp: () => set({ stamp: null, tool: "frame" }),
 
   docRev: 0,
   bumpDoc: () => set({ docRev: doc.revision }),

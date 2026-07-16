@@ -26,6 +26,20 @@ export default function App() {
         }
         return;
       }
+      // A pending stamp claims Enter (place) and Escape (cancel).
+      const stamp = useStore.getState().stamp;
+      if (stamp) {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          useStore.getState().commitStamp();
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          useStore.getState().cancelStamp();
+          return;
+        }
+      }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
         if (e.shiftKey) redo();

@@ -1,6 +1,7 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
 import { useStore } from "../store";
 import { doc } from "../lib/document";
+import { imageDataToCanvas } from "../lib/imaging";
 
 type Handle = "nw" | "ne" | "sw" | "se" | null;
 
@@ -16,6 +17,26 @@ export default function Canvas() {
   const docRev = useStore((s) => s.docRev);
   const busy = useStore((s) => s.busy);
   const progress = useStore((s) => s.progress);
+  const stamp = useStore((s) => s.stamp);
+  const commitStamp = useStore((s) => s.commitStamp);
+  const cancelStamp = useStore((s) => s.cancelStamp);
+  const flipStamp = useStore((s) => s.flipStamp);
+  const fitStampToFrame = useStore((s) => s.fitStampToFrame);
+  const stampFromFile = useStore((s) => s.stampFromFile);
+
+  const [dragOver, setDragOver] = useState(false);
+
+  // Cached HTMLCanvas of the stamp's source pixels (rebuilt only when the
+  // underlying image changes, not on every move/scale).
+  const stampCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const stampImgRef = useRef<ImageData | null>(null);
+  if (stamp && stampImgRef.current !== stamp.img) {
+    stampImgRef.current = stamp.img;
+    stampCanvasRef.current = imageDataToCanvas(stamp.img);
+  } else if (!stamp && stampImgRef.current) {
+    stampImgRef.current = null;
+    stampCanvasRef.current = null;
+  }
 
   // stable getters
   const store = useStore;
@@ -129,12 +150,116 @@ export default function Canvas() {
       ctx.fillRect(fx, fy, fw, fh);
       ctx.restore();
     }
+
+    // --- floating stamp (interactive photo placement) ---
+    const sp = st.stamp;
+    const spCanvas = stampCanvasRef.current;
+    if (sp && spCanvas) {
+      // dim the rest of the scene to focus on the stamp being placed
+      ctx.save();
+      ctx.fillStyle = "rgba(10,9,8,0.5)";
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+
+      const [sx, sy] = w2s(sp.x, sp.y);
+      const sw = sp.w * scale;
+      const sh = sp.h * scale;
+
+      ctx.save();
+      ctx.shadowColor = "rgba(0,0,0,0.6)";
+      ctx.shadowBlur = 30;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      if (sp.flipH) {
+        ctx.translate(sx + sw, sy);
+        ctx.scale(-1, 1);
+        ctx.drawImage(spCanvas, 0, 0, sw, sh);
+      } else {
+        ctx.drawImage(spCanvas, sx, sy, sw, sh);
+      }
+      ctx.restore();
+
+      // gilded selection border
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "#f4d98b";
+      ctx.setLineDash([]);
+      ctx.strokeRect(sx + 0.5, sy + 0.5, sw, sh);
+
+      // corner handles (round — distinct from the frame's square handles)
+      const hr = 5;
+      ctx.fillStyle = "#14110f";
+      ctx.strokeStyle = "#f4d98b";
+      ctx.lineWidth = 1.5;
+      for (const [hx, hy] of [
+        [sx, sy], [sx + sw, sy], [sx, sy + sh], [sx + sw, sy + sh],
+      ]) {
+        ctx.beginPath();
+        ctx.arc(hx, hy, hr, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+
+      // size label
+      ctx.font = "500 11px 'JetBrains Mono', monospace";
+      ctx.fillStyle = "rgba(216,205,182,0.9)";
+      ctx.textBaseline = "bottom";
+      ctx.fillText(`${Math.round(sp.w)}×${Math.round(sp.h)}`, sx + 2, sy - 6);
+    }
   }, [store]);
 
   // animation loop only while busy (for marching ants); else draw on demand
   useEffect(() => {
     draw();
-  }, [draw, view, frame, docRev]);
+  }, [draw, view, frame, docRev, stamp]);
+
+  // drag-and-drop a photo onto the canvas → start a stamp
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const onOver = (e: DragEvent) => {
+      if (e.dataTransfer && Array.from(e.dataTransfer.types).includes("Files")) {
+        e.preventDefault();
+        setDragOver(true);
+      }
+    };
+    const onLeave = (e: DragEvent) => {
+      if (!wrap.contains(e.relatedTarget as Node)) setDragOver(false);
+    };
+    const onDrop = (e: DragEvent) => {
+      e.preventDefault();
+      setDragOver(false);
+      const file = Array.from(e.dataTransfer?.files || []).find((f) => f.type.startsWith("image/"));
+      if (file) stampFromFile(file);
+    };
+    wrap.addEventListener("dragover", onOver);
+    wrap.addEventListener("dragleave", onLeave);
+    wrap.addEventListener("drop", onDrop);
+    return () => {
+      wrap.removeEventListener("dragover", onOver);
+      wrap.removeEventListener("dragleave", onLeave);
+      wrap.removeEventListener("drop", onDrop);
+    };
+  }, [stampFromFile]);
+
+  // paste an image from the clipboard → start a stamp
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const it of items) {
+        if (it.type.startsWith("image/")) {
+          const blob = it.getAsFile();
+          if (blob) {
+            e.preventDefault();
+            stampFromFile(blob);
+          }
+          break;
+        }
+      }
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [stampFromFile]);
 
   useEffect(() => {
     if (!busy) return;
@@ -158,10 +283,11 @@ export default function Canvas() {
     const wrap = wrapRef.current;
     if (!cv || !wrap) return;
 
-    let mode: "none" | "pan" | "move" | "resize" = "none";
+    let mode: "none" | "pan" | "move" | "resize" | "stampMove" | "stampResize" = "none";
     let handle: Handle = null;
     let last = { x: 0, y: 0 };
     let startFrame = { x: 0, y: 0, w: 0, h: 0 };
+    let startStamp = { x: 0, y: 0, w: 0, h: 0 };
 
     const rectOf = () => wrap.getBoundingClientRect();
     const s2w = (sx: number, sy: number): [number, number] => {
@@ -197,6 +323,27 @@ export default function Canvas() {
       return sx >= ax && sx <= bx && sy >= ay && sy <= by;
     };
 
+    const stampHandleAt = (sx: number, sy: number): Handle => {
+      const sp = store.getState().stamp;
+      if (!sp) return null;
+      const corners: [Handle, number, number][] = [
+        ["nw", sp.x, sp.y], ["ne", sp.x + sp.w, sp.y],
+        ["sw", sp.x, sp.y + sp.h], ["se", sp.x + sp.w, sp.y + sp.h],
+      ];
+      for (const [h, wx, wy] of corners) {
+        const [cx, cy] = w2s(wx, wy);
+        if (Math.abs(sx - cx) < 13 && Math.abs(sy - cy) < 13) return h;
+      }
+      return null;
+    };
+    const insideStamp = (sx: number, sy: number) => {
+      const sp = store.getState().stamp;
+      if (!sp) return false;
+      const [ax, ay] = w2s(sp.x, sp.y);
+      const [bx, by] = w2s(sp.x + sp.w, sp.y + sp.h);
+      return sx >= ax && sx <= bx && sy >= ay && sy <= by;
+    };
+
     const onDown = (e: PointerEvent) => {
       const r = rectOf();
       const sx = e.clientX - r.left;
@@ -204,6 +351,27 @@ export default function Canvas() {
       last = { x: e.clientX, y: e.clientY };
       const st = store.getState();
       const wantPan = e.button === 1 || e.button === 2 || st.tool === "pan" || e.shiftKey;
+
+      // A pending stamp is modal: pointer manipulates the stamp, not the frame.
+      if (st.stamp && !wantPan) {
+        const sh = stampHandleAt(sx, sy);
+        if (sh) {
+          mode = "stampResize";
+          handle = sh;
+          startStamp = { x: st.stamp.x, y: st.stamp.y, w: st.stamp.w, h: st.stamp.h };
+          cv.setPointerCapture(e.pointerId);
+          return;
+        }
+        if (insideStamp(sx, sy)) {
+          mode = "stampMove";
+          cv.setPointerCapture(e.pointerId);
+          return;
+        }
+        // clicked outside the stamp — pan the canvas instead
+        mode = "pan";
+        cv.setPointerCapture(e.pointerId);
+        return;
+      }
 
       if (!wantPan) {
         const h = hitHandle(sx, sy);
@@ -236,6 +404,13 @@ export default function Canvas() {
         // cursor feedback
         const r = rectOf();
         const sx = e.clientX - r.left, sy = e.clientY - r.top;
+        if (st.stamp) {
+          const sh = stampHandleAt(sx, sy);
+          cv.style.cursor = sh
+            ? sh === "nw" || sh === "se" ? "nwse-resize" : "nesw-resize"
+            : insideStamp(sx, sy) ? "move" : "grab";
+          return;
+        }
         const h = hitHandle(sx, sy);
         cv.style.cursor = h
           ? h === "nw" || h === "se" ? "nwse-resize" : "nesw-resize"
@@ -248,7 +423,34 @@ export default function Canvas() {
       const dy = e.clientY - last.y;
       last = { x: e.clientX, y: e.clientY };
 
-      if (mode === "pan") {
+      if (mode === "stampMove") {
+        const sp = store.getState().stamp;
+        if (sp) {
+          st.updateStamp({
+            x: Math.round(sp.x + dx / st.view.scale),
+            y: Math.round(sp.y + dy / st.view.scale),
+          });
+        }
+      } else if (mode === "stampResize" && handle) {
+        const sp = store.getState().stamp;
+        if (sp) {
+          const aspect = startStamp.w / startStamp.h; // aspect-locked to the photo
+          // opposite corner stays anchored
+          const ax = handle.includes("w") ? startStamp.x + startStamp.w : startStamp.x;
+          const ay = handle.includes("n") ? startStamp.y + startStamp.h : startStamp.y;
+          const r = rectOf();
+          const [wx, wy] = s2w(e.clientX - r.left, e.clientY - r.top);
+          const MIN = 24;
+          const newW = Math.max(MIN, Math.max(Math.abs(wx - ax), Math.abs(wy - ay) * aspect));
+          const newH = newW / aspect;
+          st.updateStamp({
+            w: Math.round(newW),
+            h: Math.round(newH),
+            x: Math.round(handle.includes("w") ? ax - newW : ax),
+            y: Math.round(handle.includes("n") ? ay - newH : ay),
+          });
+        }
+      } else if (mode === "pan") {
         st.panBy(dx, dy);
       } else if (mode === "move") {
         const f = store.getState().frame;
@@ -312,6 +514,29 @@ export default function Canvas() {
         <div className="canvas-phase num">
           {phaseLabel(progress.phase)}
           {progress.detail ? ` · ${progress.detail}` : ""}
+        </div>
+      )}
+
+      {stamp && (
+        <div className="stamp-bar">
+          <span className="stamp-hint">Placing photo</span>
+          <button className="stamp-act" onClick={() => fitStampToFrame()}>Fit to frame</button>
+          <button className="stamp-act" onClick={() => flipStamp()}>Flip</button>
+          <button className="stamp-act ghost" onClick={() => cancelStamp()}>
+            Cancel <span className="k num">esc</span>
+          </button>
+          <button className="stamp-act primary" onClick={() => commitStamp()}>
+            Place <span className="k num">⏎</span>
+          </button>
+        </div>
+      )}
+
+      {dragOver && (
+        <div className="drop-zone">
+          <div className="drop-inner">
+            <span className="drop-glyph">❖</span>
+            Drop to stamp your photo
+          </div>
         </div>
       )}
     </div>

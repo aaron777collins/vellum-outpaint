@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useStore, ALL_PROVIDERS, getProvider } from "../store";
+import { pickImageFile } from "../lib/imaging";
 
 const TILE_PRESETS: [number, number, string][] = [
   [512, 512, "square"],
@@ -48,9 +49,15 @@ export default function Rail() {
   const setRemoteUrl = useStore((s) => s.setRemoteUrl);
   const progress = useStore((s) => s.progress);
   const loadPct = useStore((s) => s.loadPct);
+  const stampFromFile = useStore((s) => s.stampFromFile);
 
   const [showNeg, setShowNeg] = useState(false);
   const [showAdv, setShowAdv] = useState(false);
+
+  const pickPhoto = async () => {
+    const f = await pickImageFile();
+    if (f) stampFromFile(f);
+  };
 
   const applyTile = (w: number, h: number) => {
     setTile(w, h);
@@ -68,6 +75,23 @@ export default function Rail() {
   return (
     <aside className="rail">
       <div className="rail-scroll">
+        {/* ---- compose / stamp a photo ---- */}
+        <section className="panel">
+          <div className="panel-title">
+            <span className="eyebrow">Compose</span>
+          </div>
+          <button className="compose-btn" onClick={pickPhoto}>
+            <span className="compose-glyph">❖</span>
+            <span className="compose-txt">
+              <span className="compose-title">Stamp a photo</span>
+              <span className="compose-sub">position &amp; scale, then outpaint around it</span>
+            </span>
+          </button>
+          <div className="hint" style={{ marginTop: 10, marginBottom: 0 }}>
+            or drag an image onto the canvas · paste with ⌘V
+          </div>
+        </section>
+
         {/* ---- prompt ---- */}
         <section className="panel">
           <div className="panel-title">

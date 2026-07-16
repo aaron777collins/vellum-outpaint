@@ -1,31 +1,18 @@
-import { useRef } from "react";
 import { useStore } from "../store";
 import { doc } from "../lib/document";
-import { loadImageData } from "../lib/imaging";
+import { pickImageFile } from "../lib/imaging";
 
 export default function TopBar() {
-  const fileRef = useRef<HTMLInputElement>(null);
   const undo = useStore((s) => s.undo);
   const redo = useStore((s) => s.redo);
   const clearDoc = useStore((s) => s.clearDoc);
   const exportPng = useStore((s) => s.exportPng);
-  const bumpDoc = useStore((s) => s.bumpDoc);
   const setView = useStore((s) => s.setView);
-  const setFrame = useStore((s) => s.setFrame);
-  const toast = useStore((s) => s.toast);
+  const stampFromFile = useStore((s) => s.stampFromFile);
 
-  const onImport = async (file: File) => {
-    try {
-      const img = await loadImageData(file);
-      const rect = doc.place(img, 0, 0);
-      bumpDoc();
-      // fit frame to image and view to content
-      setFrame({ x: rect.x, y: rect.y, w: Math.min(1024, rect.w), h: Math.min(1024, rect.h) });
-      fitToContent();
-      toast("success", "Image placed — drag the frame past its edge to outpaint");
-    } catch {
-      toast("error", "Could not read that image");
-    }
+  const onImport = async () => {
+    const f = await pickImageFile();
+    if (f) stampFromFile(f);
   };
 
   const fitToContent = () => {
@@ -52,7 +39,7 @@ export default function TopBar() {
       </div>
 
       <div className="topbar-actions">
-        <button className="tb-btn" onClick={() => fileRef.current?.click()}>
+        <button className="tb-btn" onClick={onImport} title="Stamp a photo onto the canvas">
           Import
         </button>
         <button className="tb-btn" onClick={exportPng}>Export</button>
@@ -63,18 +50,6 @@ export default function TopBar() {
         <button className="tb-icon" title="Fit to content" onClick={fitToContent}>⤢</button>
         <button className="tb-icon danger" title="Clear canvas" onClick={() => clearDoc()}>⌫</button>
       </div>
-
-      <input
-        ref={fileRef}
-        type="file"
-        accept="image/*"
-        hidden
-        onChange={(e) => {
-          const f = e.target.files?.[0];
-          if (f) onImport(f);
-          e.target.value = "";
-        }}
-      />
     </header>
   );
 }
