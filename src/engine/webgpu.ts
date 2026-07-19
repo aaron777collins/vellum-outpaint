@@ -98,6 +98,126 @@ const NUM_TRAIN = 1000;
 const BETA_START = 0.00085;
 const BETA_END = 0.012;
 
+// --- robustness knobs --------------------------------------------------------
+// A single ONNX op finishes in well under a second on any working GPU; if one
+// takes longer than this the WebGPU device is almost certainly hung/lost (a lost
+// device leaves run() pending FOREVER, which is the "never finishes / infinite
+// loop" report). The watchdog converts that hang into a catchable error.
+const OP_TIMEOUT_MS = 90_000;
+const RELOAD_TIMEOUT_MS = 180_000;
+// How many times to rebuild the sessions + retry a generation that came back
+// degenerate before giving up. Bounded so a deterministically-black GPU can't
+// loop endlessly.
+const MAX_ATTEMPTS = 2;
+
+// Thrown internally when a produced latent/frame is degenerate (all-black /
+// NaN-poisoned). Caught by the attempt loop to trigger a bounded reload+retry.
+class DegenerateFrameError extends Error {
+  constructor(msg = "degenerate frame") {
+    super(msg);
+    this.name = "DegenerateFrameError";
+  }
+}
+
+// Race a promise against a deadline AND an abort signal. A hung WebGPU device
+// (device-lost commonly leaves run()/create() pending indefinitely) or a user
+// cancel becomes a rejected promise instead of an infinite wait. Legitimate ops
+// resolve far inside the deadline, so this never fires in the happy path.
+function withDeadline<T>(p: Promise<T>, ms: number, label: string, signal?: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const done = (fn: (v: unknown) => void, v: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      fn(v);
+    };
+    const timer = setTimeout(
+      () =>
+        done(
+          reject as (v: unknown) => void,
+          new Error(
+            `${label} timed out after ${Math.round(ms / 1000)}s — the GPU is unresponsive. ` +
+              "Reload the page, or switch to the Remote engine.",
+          ),
+        ),
+      ms,
+    );
+    const onAbort = () => done(reject as (v: unknown) => void, new GenerationAbortError());
+    if (signal?.aborted) {
+      done(reject as (v: unknown) => void, new GenerationAbortError());
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    p.then(
+      (v) => done(resolve as (v: unknown) => void, v),
+      (e) => done(reject as (v: unknown) => void, e),
+    );
+  });
+}
+
+// Replace non-finite values with 0 and clamp to a sane magnitude, in place. One
+// fp16 overflow in a single op would otherwise turn the whole latent NaN and
+// decode to a black frame; sanitizing keeps a stray overflow from poisoning the
+// rest. Returns the fraction of values that were non-finite — a large fraction
+// means the tensor is genuinely garbage (a real GPU failure), not a stray spike.
+function sanitizeLatent(a: Float32Array, clampMag = 1e4): number {
+  let bad = 0;
+  for (let i = 0; i < a.length; i++) {
+    const v = a[i];
+    if (!Number.isFinite(v)) {
+      a[i] = 0;
+      bad++;
+    } else if (v > clampMag) a[i] = clampMag;
+    else if (v < -clampMag) a[i] = -clampMag;
+  }
+  return a.length ? bad / a.length : 1;
+}
+
+// Health of a VAE-encoded latent. A well-formed SD latent (after the 0.18215
+// scale) is small and varied — values roughly N(0, ~1), so RMS is order-1 and
+// variance is clearly non-zero. The fp16 VAE encoder overflowing on a real photo
+// instead yields either a NaN/Inf-riddled tensor (high `bad` fraction), a
+// blown-up one (huge RMS), or — once sanitized/clamped — a near-constant one
+// (dead). Any of those decodes to black. Sampled so it stays cheap on 16k-elem
+// latents. Used to decide whether to retry the encode softer or bail to noise.
+function latentHealth(a: Float32Array): { rms: number; dead: boolean } {
+  let sum = 0;
+  let sum2 = 0;
+  let n = 0;
+  const stride = Math.max(1, Math.floor(a.length / 4096));
+  for (let i = 0; i < a.length; i += stride) {
+    const v = a[i];
+    sum += v;
+    sum2 += v * v;
+    n++;
+  }
+  if (n === 0) return { rms: 0, dead: true };
+  const mean = sum / n;
+  const variance = sum2 / n - mean * mean;
+  return { rms: Math.sqrt(sum2 / n), dead: !Number.isFinite(variance) || variance < 1e-8 };
+}
+
+// A latent that is essentially constant (near-zero variance) decodes to a flat
+// frame — the pre-decode signature of a failed GPU run. Sampled so it stays cheap.
+function latentIsDead(a: Float32Array): boolean {
+  let sum = 0;
+  let sum2 = 0;
+  let n = 0;
+  const stride = Math.max(1, Math.floor(a.length / 4096));
+  for (let i = 0; i < a.length; i += stride) {
+    const v = a[i];
+    sum += v;
+    sum2 += v * v;
+    n++;
+  }
+  if (n === 0) return true;
+  const mean = sum / n;
+  const variance = sum2 / n - mean * mean;
+  return !Number.isFinite(variance) || variance < 1e-8;
+}
+
 // ---------- fp16 helpers ------------------------------------------------------
 function packF16(src: Float32Array): Uint16Array {
   const out = new Uint16Array(src.length);
@@ -234,6 +354,11 @@ export class WebGpuProvider implements DiffusionProvider {
   private tokenizer: any = null;
   private loaded = false;
   private meta: Record<string, SessMeta> = {};
+  // Serialize generations at the provider level. ONNX sessions are NOT reentrant:
+  // two overlapping run()s on the same session corrupt each other's GPU buffers
+  // (a route to black/garbage frames). The store already guards, but a provider
+  // that can be driven from anywhere must protect itself too.
+  private inFlight = false;
 
   constructor(
     id: ProviderId = "webgpu",
@@ -487,6 +612,17 @@ export class WebGpuProvider implements DiffusionProvider {
     await this.load(onProgress);
   }
 
+  // Run one ONNX session under the hang/abort watchdog. Every GPU inference in
+  // this file goes through here so none of them can wedge the pipeline forever.
+  private runSess(
+    sess: ort.InferenceSession,
+    feeds: Record<string, ort.Tensor>,
+    label: string,
+    signal?: AbortSignal,
+  ): Promise<ort.InferenceSession.OnnxValueMapType> {
+    return withDeadline(sess.run(feeds), OP_TIMEOUT_MS, `${label}`, signal);
+  }
+
   // ------------------------------------------------------ dtype-aware tensors
   // Build an ORT tensor for input `name` of session `key`, converting canonical
   // Float32 data into whatever precision the model actually declares.
@@ -523,7 +659,7 @@ export class WebGpuProvider implements DiffusionProvider {
   }
 
   // ------------------------------------------------------------------ encode
-  private async encodeText(prompt: string): Promise<{ data: Float32Array; dims: readonly number[] }> {
+  private async encodeText(prompt: string, signal?: AbortSignal): Promise<{ data: Float32Array; dims: readonly number[] }> {
     const enc = await this.tokenizer(prompt, {
       padding: "max_length",
       max_length: 77,
@@ -536,7 +672,7 @@ export class WebGpuProvider implements DiffusionProvider {
     const input = this.meta.text.in[inName] === "int64"
       ? new ort.Tensor("int64", BigInt64Array.from(ids.map((v) => BigInt(v))), [1, 77])
       : new ort.Tensor("int32", Int32Array.from(ids), [1, 77]);
-    const res = await this.sessions.text!.run({ [inName]: input });
+    const res = await this.runSess(this.sessions.text!, { [inName]: input }, "text encoder", signal);
     const out = res[this.meta.text.outNames[0]] as ort.Tensor;
     // Capture dims BEFORE readFloatOutput (which disposes the tensor). Return
     // canonical float32; the unet builds its own hidden tensor in the precision
@@ -545,24 +681,79 @@ export class WebGpuProvider implements DiffusionProvider {
     return { data: this.readFloatOutput(out), dims };
   }
 
-  private async vaeEncode(img: ImageData, L: number): Promise<Float32Array> {
+  // Run the VAE encoder once. `contrast` (0..1) lerps the input toward mid-grey
+  // BEFORE encoding: the encoder is the sole fp16 stage in the turbo pipeline and
+  // fp16 VAE encoders famously overflow their internal activations on
+  // high-contrast, out-of-distribution inputs (real photographs) — emitting Inf
+  // that unpacks to a non-finite latent, i.e. a guaranteed black decode. Shrinking
+  // the input's dynamic range shrinks those activations and often dodges the
+  // overflow while preserving structure/colour. Does NOT throw: returns the
+  // sanitized latent plus the fraction of values that were non-finite, so the
+  // caller can retry softer or fall back to noise instead of committing a black
+  // tile. (Sanitize still runs so Inf/NaN never propagate downstream.)
+  private async vaeEncode(
+    img: ImageData,
+    L: number,
+    signal?: AbortSignal,
+    contrast = 1,
+  ): Promise<{ latent: Float32Array; bad: number }> {
     // pixels -> [1,3,H,W] in [-1,1]; makeFloatInput casts to the model's dtype
     const size = L * 8;
     const scaled = resizeImageData(img, size, size);
     const chw = new Float32Array(3 * size * size);
     const d = scaled.data;
     for (let p = 0, i = 0; p < d.length; p += 4, i++) {
-      chw[i] = d[p] / 127.5 - 1;
-      chw[size * size + i] = d[p + 1] / 127.5 - 1;
-      chw[2 * size * size + i] = d[p + 2] / 127.5 - 1;
+      chw[i] = (d[p] / 127.5 - 1) * contrast;
+      chw[size * size + i] = (d[p + 1] / 127.5 - 1) * contrast;
+      chw[2 * size * size + i] = (d[p + 2] / 127.5 - 1) * contrast;
     }
     const inName = this.meta.vaeEnc.inNames[0];
     const t = this.makeFloatInput("vaeEnc", inName, chw, [1, 3, size, size]);
-    const res = await this.sessions.vaeEnc!.run({ [inName]: t });
+    const res = await this.runSess(this.sessions.vaeEnc!, { [inName]: t }, "vae encoder", signal);
     const out = res[this.meta.vaeEnc.outNames[0]] as ort.Tensor;
     const latent = this.readFloatOutput(out);
     for (let i = 0; i < latent.length; i++) latent[i] *= VAE_SCALE;
-    return latent; // [1,4,L,L] flattened
+    const bad = sanitizeLatent(latent);
+    return { latent, bad }; // [1,4,L,L] flattened
+  }
+
+  // Robustly turn `init` pixels into an img2img/outpaint init latent. The fp16
+  // VAE encoder can overflow on real photos (see vaeEncode) — the actual root
+  // cause of "stamp a photo → black outpaint". Rather than reload the GPU (the
+  // overflow is DETERMINISTIC, so a reload + the same photo overflows identically)
+  // we degrade gracefully: retry the encode at progressively lower contrast, and
+  // if the encoder still can't produce a healthy latent, return null so the
+  // caller seeds from pure noise (txt2img-style). The known pixels are preserved
+  // regardless by the feathered composite downstream, so the worst outcome is a
+  // less-coherent outpaint — never a black one.
+  private async encodeInitLatent(
+    init: ImageData,
+    L: number,
+    onProgress: (p: EngineProgress) => void,
+    signal?: AbortSignal,
+  ): Promise<Float32Array | null> {
+    const contrasts = [1, 0.75, 0.5];
+    for (let i = 0; i < contrasts.length; i++) {
+      if (signal?.aborted) throw new GenerationAbortError();
+      const { latent, bad } = await this.vaeEncode(init, L, signal, contrasts[i]);
+      const h = latentHealth(latent);
+      // Accept only a genuinely well-formed latent: essentially no non-finite
+      // values, varied (not collapsed), and not blown up. Healthy SD latents sit
+      // around RMS ~1, so 50 is loose headroom that still rejects overflow.
+      if (bad <= 0.01 && !h.dead && h.rms < 50) return latent;
+      const softer = i + 1 < contrasts.length;
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[vellum] VAE encode unstable (bad=${(bad * 100).toFixed(1)}%, rms=${h.rms.toFixed(1)}, dead=${h.dead}) at contrast ${contrasts[i]} — ${softer ? "retrying softer" : "falling back to noise init"}.`,
+      );
+      onProgress({
+        phase: "encoding",
+        detail: softer
+          ? "photo encode overflowed fp16 — retrying softer…"
+          : "photo encode unstable — seeding fresh area from noise…",
+      });
+    }
+    return null;
   }
 
   // Run the unet once and return the predicted noise (eps) for a pre-scaled
@@ -572,6 +763,7 @@ export class WebGpuProvider implements DiffusionProvider {
     timestep: number,
     hidden: { data: Float32Array; dims: readonly number[] },
     L: number,
+    signal?: AbortSignal,
   ): Promise<Float32Array> {
     const feeds: Record<string, ort.Tensor> = {};
     const inNames = this.meta.unet.inNames;
@@ -581,16 +773,21 @@ export class WebGpuProvider implements DiffusionProvider {
       else if (ln.includes("timestep") || ln === "t") feeds[n] = this.makeStep("unet", n, timestep);
       else if (ln.includes("hidden") || ln.includes("encoder")) feeds[n] = this.makeFloatInput("unet", n, hidden.data, hidden.dims);
     }
-    const res = await this.sessions.unet!.run(feeds);
-    return this.readFloatOutput(res[this.meta.unet.outNames[0]] as ort.Tensor);
+    const res = await this.runSess(this.sessions.unet!, feeds, "unet", signal);
+    const eps = this.readFloatOutput(res[this.meta.unet.outNames[0]] as ort.Tensor);
+    // Keep a single overflow from poisoning every subsequent step. A wholly
+    // non-finite eps means the GPU run failed — bail to a reload+retry.
+    const bad = sanitizeLatent(eps);
+    if (bad > 0.25) throw new DegenerateFrameError(`unet produced ${Math.round(bad * 100)}% non-finite values`);
+    return eps;
   }
 
-  private async vaeDecode(latent: Float32Array, L: number): Promise<ImageData> {
+  private async vaeDecode(latent: Float32Array, L: number, signal?: AbortSignal): Promise<ImageData> {
     const inp = new Float32Array(latent.length);
     for (let i = 0; i < latent.length; i++) inp[i] = latent[i] / VAE_SCALE;
     const inName = this.meta.vaeDec.inNames[0];
     const t = this.makeFloatInput("vaeDec", inName, inp, [1, 4, L, L]);
-    const res = await this.sessions.vaeDec!.run({ [inName]: t });
+    const res = await this.runSess(this.sessions.vaeDec!, { [inName]: t }, "vae decoder", signal);
     const out = res[this.meta.vaeDec.outNames[0]] as ort.Tensor;
     const size = L * 8;
     const chw = this.readFloatOutput(out);
@@ -606,13 +803,70 @@ export class WebGpuProvider implements DiffusionProvider {
   }
 
   // ---------------------------------------------------------------- generate
+  // Public entry: serialize, then run the pipeline under a bounded reload+retry
+  // loop. Every failure mode here is finite — a degenerate/black frame triggers
+  // at most MAX_ATTEMPTS-1 reloads, a hung GPU trips the per-op watchdog, and an
+  // abort short-circuits immediately. There is no path that can spin forever.
   async generate(
     req: GenerateRequest,
     onProgress: (p: EngineProgress) => void,
     signal?: AbortSignal,
-    _retry = false,
   ): Promise<GenerateResult> {
     if (!this.loaded) throw new Error("WebGPU engine not loaded.");
+    if (this.inFlight) {
+      throw new Error("A generation is already running — wait for it to finish or cancel it.");
+    }
+    this.inFlight = true;
+    try {
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        if (signal?.aborted) throw new GenerationAbortError();
+        try {
+          return await this.runPipeline(req, onProgress, signal);
+        } catch (e) {
+          // Abort and genuine hangs are not retryable — surface them at once.
+          if (e instanceof GenerationAbortError) throw e;
+          const degenerate = e instanceof DegenerateFrameError;
+          if (degenerate && attempt < MAX_ATTEMPTS) {
+            // Rebuild the sessions + WebGPU device (weights are cached, so this is
+            // fast) and try once more. Guarded by its own deadline so a device
+            // that's wedged during teardown can't hang the reload forever.
+            onProgress({ phase: "compiling", detail: "GPU returned an empty frame — reinitializing…" });
+            try {
+              await withDeadline(this.reloadSessions(onProgress), RELOAD_TIMEOUT_MS, "GPU reinitialization", signal);
+            } catch (re) {
+              if (re instanceof GenerationAbortError) throw re;
+              throw new Error(
+                "Couldn't recover the GPU after an empty frame. Reload the page, or switch to the " +
+                  "SD 1.5 or Remote engine. (" + (re instanceof Error ? re.message : String(re)) + ")",
+              );
+            }
+            continue;
+          }
+          if (degenerate) {
+            throw new Error(
+              "The GPU returned an empty (black) frame twice, even after reinitializing. This usually " +
+                "means the browser is on a low-power/integrated GPU or is out of video memory — not your " +
+                "prompt. Try: reload the page, close other GPU-heavy tabs, switch to the Remote engine, " +
+                "or use a machine with a discrete GPU.",
+            );
+          }
+          throw e;
+        }
+      }
+      // Unreachable: the loop either returns, retries, or throws.
+      throw new Error("Generation failed after all attempts.");
+    } finally {
+      this.inFlight = false;
+    }
+  }
+
+  // One full text→(vae)→unet→vae pass. Throws DegenerateFrameError when a latent
+  // or the decoded frame is empty/NaN-poisoned, GenerationAbortError on cancel.
+  private async runPipeline(
+    req: GenerateRequest,
+    onProgress: (p: EngineProgress) => void,
+    signal?: AbortSignal,
+  ): Promise<GenerateResult> {
     const t0 = performance.now();
     const L = this.manifest.latent;
     const size = L * 8;
@@ -621,10 +875,10 @@ export class WebGpuProvider implements DiffusionProvider {
     check();
 
     onProgress({ phase: "encoding", detail: "text", fraction: 0.08 });
-    const hidden = await this.encodeText(req.prompt);
+    const hidden = await this.encodeText(req.prompt, signal);
     // Unconditional embedding for classifier-free guidance (non-turbo only).
     const useCfg = !this.manifest.turbo && req.guidance > 1;
-    const uncond = useCfg ? await this.encodeText(req.negativePrompt || "") : null;
+    const uncond = useCfg ? await this.encodeText(req.negativePrompt || "", signal) : null;
 
     const knownAtSize = req.initImage ? resizeImageData(req.initImage, size, size) : null;
     const isImg = !!(req.initImage && knownAtSize);
@@ -635,26 +889,33 @@ export class WebGpuProvider implements DiffusionProvider {
     if (this.manifest.turbo) {
       // ---- single-step turbo path ----
       let sigma: number;
+      const n = 4 * L * L;
+      let z: Float32Array | null = null;
       if (isImg && knownAtSize) {
         const { init } = buildOutpaintInit(knownAtSize, seed);
         onProgress({ phase: "encoding", detail: "vae", fraction: 0.25 });
-        const z = await this.vaeEncode(init, L);
+        z = await this.encodeInitLatent(init, L, onProgress, signal);
+      }
+      if (z) {
+        // img2img: noise the encoded latent by `strength`.
         sigma = Math.max(0.05, req.strength) * SIGMA_MAX;
         const noise = seededGaussian(z.length, seed);
         latent = new Float32Array(z.length);
         for (let i = 0; i < z.length; i++) latent[i] = z[i] + sigma * noise[i];
       } else {
+        // txt2img, or img2img whose fp16 encode overflowed — seed from full noise.
+        // The feathered composite still blends the real photo back at the seam.
         sigma = SIGMA_MAX;
-        const noise = seededGaussian(4 * L * L, seed);
-        latent = new Float32Array(noise.length);
-        for (let i = 0; i < noise.length; i++) latent[i] = noise[i] * sigma;
+        const noise = seededGaussian(n, seed);
+        latent = new Float32Array(n);
+        for (let i = 0; i < n; i++) latent[i] = noise[i] * sigma;
       }
       check();
       onProgress({ phase: "sampling", step: 1, totalSteps: 1, fraction: 0.6, detail: "1 step (turbo)" });
       const cin = 1 / Math.sqrt(sigma * sigma + 1);
       const scaled = new Float32Array(latent.length);
       for (let i = 0; i < latent.length; i++) scaled[i] = latent[i] * cin;
-      const eps = await this.runUnet(scaled, TURBO_TIMESTEP, hidden, L);
+      const eps = await this.runUnet(scaled, TURBO_TIMESTEP, hidden, L, signal);
       finalLatent = new Float32Array(latent.length);
       for (let i = 0; i < latent.length; i++) finalLatent[i] = latent[i] - sigma * eps[i];
     } else {
@@ -664,15 +925,20 @@ export class WebGpuProvider implements DiffusionProvider {
       let start = 0;
       const n = 4 * L * L;
       const noise = seededGaussian(n, seed);
+      let z: Float32Array | null = null;
       if (isImg && knownAtSize) {
         const { init } = buildOutpaintInit(knownAtSize, seed);
         onProgress({ phase: "encoding", detail: "vae", fraction: 0.2 });
-        const z = await this.vaeEncode(init, L);
+        z = await this.encodeInitLatent(init, L, onProgress, signal);
+      }
+      if (z) {
         // strength => how many of the later steps to run (denoise from noised z0)
         start = Math.min(steps - 1, Math.max(0, Math.round((1 - req.strength) * steps)));
         latent = new Float32Array(n);
         for (let i = 0; i < n; i++) latent[i] = z[i] + sigmas[start] * noise[i];
       } else {
+        // txt2img, or img2img whose fp16 encode overflowed — start from full noise.
+        start = 0;
         latent = new Float32Array(n);
         for (let i = 0; i < n; i++) latent[i] = noise[i] * sigmas[start];
       }
@@ -685,10 +951,10 @@ export class WebGpuProvider implements DiffusionProvider {
         const scaled = new Float32Array(latent.length);
         for (let k = 0; k < latent.length; k++) scaled[k] = latent[k] * cin;
         const tstep = ts[i];
-        const epsCond = await this.runUnet(scaled, tstep, hidden, L);
+        const epsCond = await this.runUnet(scaled, tstep, hidden, L, signal);
         let eps = epsCond;
         if (useCfg && uncond) {
-          const epsUncond = await this.runUnet(scaled, tstep, uncond, L);
+          const epsUncond = await this.runUnet(scaled, tstep, uncond, L, signal);
           eps = new Float32Array(epsCond.length);
           for (let k = 0; k < eps.length; k++)
             eps[k] = epsUncond[k] + req.guidance * (epsCond[k] - epsUncond[k]);
@@ -708,28 +974,22 @@ export class WebGpuProvider implements DiffusionProvider {
     }
 
     check();
-    onProgress({ phase: "decoding", fraction: 0.9 });
-    const decoded = await this.vaeDecode(finalLatent, L);
+    // Pre-decode guard: a NaN-poisoned or flat latent will only ever decode to a
+    // black frame, so catch it here (cheap) and let the attempt loop reload+retry
+    // instead of paying for a decode that we already know is dead.
+    sanitizeLatent(finalLatent);
+    if (latentIsDead(finalLatent)) {
+      throw new DegenerateFrameError("latent collapsed to a constant before decode");
+    }
 
-    // WebGPU safety net. Our CPU reference (txt2img → img2img → img2img) proves
-    // the pipeline is numerically correct, so an all-black / flat frame here is a
-    // GPU-execution failure (device lost, VRAM exhaustion, or a low-power GPU
-    // that only survived one run) — the "works the first time, then black" bug.
-    // Recover ONCE by rebuilding the sessions (weights are cached, so this is
-    // fast and re-initializes the GPU device), then fail loudly rather than
-    // silently committing a black tile to the canvas.
+    onProgress({ phase: "decoding", fraction: 0.9 });
+    const decoded = await this.vaeDecode(finalLatent, L, signal);
+
+    // Post-decode safety net: an all-black / flat frame is a GPU-execution
+    // failure (device lost, VRAM exhaustion, low-power GPU). Signal the attempt
+    // loop to reload+retry rather than committing a black tile to the canvas.
     if (isDegenerateFrame(decoded)) {
-      if (!_retry) {
-        onProgress({ phase: "compiling", detail: "GPU returned an empty frame — reinitializing…" });
-        await this.reloadSessions(onProgress);
-        return this.generate(req, onProgress, signal, true);
-      }
-      throw new Error(
-        "The GPU returned an empty (black) frame. This is almost always the browser " +
-          "using a low-power/integrated GPU or running out of video memory — not your " +
-          "prompt. Try: reload the page, close other GPU-heavy tabs, switch to the SD 1.5 " +
-          "or Remote engine, or use a machine with a discrete GPU.",
-      );
+      throw new DegenerateFrameError("decoder returned a flat frame");
     }
 
     const outAtReq = resizeImageData(decoded, req.width, req.height);

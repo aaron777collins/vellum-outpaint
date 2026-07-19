@@ -39,15 +39,3 @@ export const AMBIENT_VERSES: Verse[] = [
   { text: "Enlarge the place of thy tent... lengthen thy cords, and strengthen thy stakes.", ref: "Isaiah 54:2" },
 ];
 
-/** Deterministic-ish pick that still rotates over a session, without Math.random at import. */
-export function pickVerse(pool: Verse[], seed: number): Verse {
-  const i = Math.abs(Math.floor(seed)) % pool.length;
-  return pool[i];
-}
-
-let ambientCursor = 0;
-export function nextAmbientVerse(): Verse {
-  const v = AMBIENT_VERSES[ambientCursor % AMBIENT_VERSES.length];
-  ambientCursor += 1;
-  return v;
-}

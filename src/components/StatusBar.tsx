@@ -1,25 +1,22 @@
 import { useEffect, useState } from "react";
 import { useStore } from "../store";
-import { nextAmbientVerse, type Verse } from "../lib/verses";
-import { GENERATING_VERSES, pickVerse } from "../lib/verses";
+import { AMBIENT_VERSES, GENERATING_VERSES, type Verse } from "../lib/verses";
 
 export default function StatusBar() {
   const busy = useStore((s) => s.busy);
-  const progress = useStore((s) => s.progress);
   const view = useStore((s) => s.view);
   const frame = useStore((s) => s.frame);
-  const [verse, setVerse] = useState<Verse>(() => nextAmbientVerse());
+  const [cursor, setCursor] = useState(0);
 
-  // rotate the ambient illumination while idle
+  // Rotate illuminations on a slow, steady cadence — the same tempo whether
+  // idle or generating, so verses never flicker with per-step progress updates.
   useEffect(() => {
-    if (busy) return;
-    const t = setInterval(() => setVerse(nextAmbientVerse()), 16000);
+    const t = setInterval(() => setCursor((c) => c + 1), 16000);
     return () => clearInterval(t);
-  }, [busy]);
+  }, []);
 
-  const shown: Verse = busy
-    ? pickVerse(GENERATING_VERSES, (progress.step ?? 0) + (progress.phase?.length ?? 0))
-    : verse;
+  const pool = busy ? GENERATING_VERSES : AMBIENT_VERSES;
+  const shown: Verse = pool[cursor % pool.length];
 
   return (
     <footer className="statusbar">
