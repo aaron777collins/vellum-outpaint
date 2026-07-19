@@ -11,12 +11,19 @@ export default function Canvas() {
   const ref = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const raf = useRef(0);
+  // Latest pointer position in canvas-screen coords (for the erase brush ring),
+  // or null when the pointer is off-canvas. Kept in a ref so tracking it doesn't
+  // trigger React re-renders on every mouse move.
+  const mouseRef = useRef<{ x: number; y: number } | null>(null);
+  const drawRef = useRef<() => void>(() => {});
 
   const view = useStore((s) => s.view);
   const frame = useStore((s) => s.frame);
   const docRev = useStore((s) => s.docRev);
   const busy = useStore((s) => s.busy);
   const progress = useStore((s) => s.progress);
+  const tool = useStore((s) => s.tool);
+  const brushSize = useStore((s) => s.brushSize);
   const stamp = useStore((s) => s.stamp);
   const commitStamp = useStore((s) => s.commitStamp);
   const cancelStamp = useStore((s) => s.cancelStamp);
@@ -205,12 +212,30 @@ export default function Canvas() {
       ctx.textBaseline = "bottom";
       ctx.fillText(`${Math.round(sp.w)}×${Math.round(sp.h)}`, sx + 2, sy - 6);
     }
+
+    // --- erase brush ring (cursor) ---
+    if (st.tool === "erase" && !st.stamp && mouseRef.current) {
+      const { x: mx, y: my } = mouseRef.current;
+      const rad = (st.brushSize / 2) * scale;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(mx, my, rad, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(197,106,82,0.12)";
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "rgba(244,217,139,0.9)";
+      ctx.setLineDash([4, 4]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
   }, [store]);
+  drawRef.current = draw;
 
   // animation loop only while busy (for marching ants); else draw on demand
   useEffect(() => {
     draw();
-  }, [draw, view, frame, docRev, stamp]);
+  }, [draw, view, frame, docRev, stamp, tool, brushSize]);
 
   // drag-and-drop a photo onto the canvas → start a stamp
   useEffect(() => {
@@ -283,11 +308,12 @@ export default function Canvas() {
     const wrap = wrapRef.current;
     if (!cv || !wrap) return;
 
-    let mode: "none" | "pan" | "move" | "resize" | "stampMove" | "stampResize" = "none";
+    let mode: "none" | "pan" | "move" | "resize" | "stampMove" | "stampResize" | "erase" = "none";
     let handle: Handle = null;
     let last = { x: 0, y: 0 };
     let startFrame = { x: 0, y: 0, w: 0, h: 0 };
     let startStamp = { x: 0, y: 0, w: 0, h: 0 };
+    let lastErase = { x: 0, y: 0 }; // world coords of the previous erase dab
 
     const rectOf = () => wrap.getBoundingClientRect();
     const s2w = (sx: number, sy: number): [number, number] => {
@@ -373,6 +399,17 @@ export default function Canvas() {
         return;
       }
 
+      // Erase tool: drag paints transparency into the world (inpaint targets).
+      if (!wantPan && st.tool === "erase") {
+        mode = "erase";
+        st.beginErase();
+        const [wx, wy] = s2w(sx, sy);
+        st.eraseAt(wx, wy);
+        lastErase = { x: wx, y: wy };
+        cv.setPointerCapture(e.pointerId);
+        return;
+      }
+
       if (!wantPan) {
         const h = hitHandle(sx, sy);
         if (h) {
@@ -400,6 +437,12 @@ export default function Canvas() {
 
     const onMove = (e: PointerEvent) => {
       const st = store.getState();
+      // Keep the erase brush ring glued to the cursor (hover and drag alike).
+      if (st.tool === "erase" && !st.stamp) {
+        const r0 = rectOf();
+        mouseRef.current = { x: e.clientX - r0.left, y: e.clientY - r0.top };
+        if (mode !== "erase") drawRef.current();
+      }
       if (mode === "none") {
         // cursor feedback
         const r = rectOf();
@@ -422,6 +465,23 @@ export default function Canvas() {
       const dx = e.clientX - last.x;
       const dy = e.clientY - last.y;
       last = { x: e.clientX, y: e.clientY };
+
+      if (mode === "erase") {
+        const r = rectOf();
+        const [wx, wy] = s2w(e.clientX - r.left, e.clientY - r.top);
+        // Interpolate dabs between the last and current point so a fast drag
+        // erases a continuous stroke instead of a dotted line.
+        const step = Math.max(2, st.brushSize / 4);
+        const dxw = wx - lastErase.x, dyw = wy - lastErase.y;
+        const dist = Math.hypot(dxw, dyw);
+        const n = Math.max(1, Math.floor(dist / step));
+        for (let k = 1; k <= n; k++) {
+          st.eraseAt(lastErase.x + (dxw * k) / n, lastErase.y + (dyw * k) / n);
+        }
+        lastErase = { x: wx, y: wy };
+        drawRef.current();
+        return;
+      }
 
       if (mode === "stampMove") {
         const sp = store.getState().stamp;
@@ -492,18 +552,26 @@ export default function Canvas() {
       store.getState().zoomAt(factor, e.clientX - r.left, e.clientY - r.top, r.width, r.height);
     };
     const onContext = (e: Event) => e.preventDefault();
+    const onLeave = () => {
+      if (mouseRef.current) {
+        mouseRef.current = null;
+        drawRef.current();
+      }
+    };
 
     cv.addEventListener("pointerdown", onDown);
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     cv.addEventListener("wheel", onWheel, { passive: false });
     cv.addEventListener("contextmenu", onContext);
+    cv.addEventListener("pointerleave", onLeave);
     return () => {
       cv.removeEventListener("pointerdown", onDown);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       cv.removeEventListener("wheel", onWheel);
       cv.removeEventListener("contextmenu", onContext);
+      cv.removeEventListener("pointerleave", onLeave);
     };
   }, [store]);
 

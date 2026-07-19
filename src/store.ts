@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { doc, type Rect } from "./lib/document";
 import { ctxOf, imageDataToCanvas, loadImageData, makeCanvas } from "./lib/imaging";
+import { captionImage } from "./lib/caption";
 import {
   ALL_PROVIDERS,
   getProvider,
@@ -11,7 +12,9 @@ import {
 } from "./engine";
 import { GenerationAbortError } from "./engine/types";
 
-export type Tool = "pan" | "frame" | "move" | "stamp";
+export type Tool = "pan" | "frame" | "move" | "stamp" | "erase";
+
+export type ExpandDir = "left" | "right" | "up" | "down";
 
 /**
  * A photo being interactively placed onto the canvas. It floats above the world
@@ -45,6 +48,7 @@ interface Persisted {
   tileH: number;
   engineId: ProviderId;
   remoteUrl: string;
+  brushSize: number;
 }
 
 function loadPersisted(): Partial<Persisted> {
@@ -79,6 +83,12 @@ interface AppState {
   tileH: number;
   setTile: (w: number, h: number) => void;
 
+  // erase brush (world-unit diameter)
+  brushSize: number;
+  setBrushSize: (d: number) => void;
+  beginErase: () => void;
+  eraseAt: (wx: number, wy: number) => void;
+
   // params
   params: SamplingParams;
   setParams: (p: Partial<SamplingParams>) => void;
@@ -97,7 +107,12 @@ interface AppState {
   busy: boolean;
   loadPct: number;
   generate: () => Promise<void>;
+  expand: (dir: ExpandDir) => Promise<void>;
   cancel: () => void;
+
+  // auto-prompt (image captioning)
+  captioning: boolean;
+  suggestPrompt: () => Promise<void>;
 
   // stamp (interactive photo placement)
   stamp: Stamp | null;
@@ -133,6 +148,7 @@ function savePersisted(s: AppState) {
     tileH: s.tileH,
     engineId: s.engineId,
     remoteUrl: s.remoteUrl,
+    brushSize: s.brushSize,
   };
   try {
     localStorage.setItem(LS_KEY, JSON.stringify(p));
@@ -170,6 +186,19 @@ export const useStore = create<AppState>((set, get) => ({
       savePersisted({ ...s, ...next } as AppState);
       return next;
     }),
+
+  brushSize: persisted.brushSize ?? 96,
+  setBrushSize: (d) =>
+    set((s) => {
+      const brushSize = Math.min(512, Math.max(16, Math.round(d)));
+      savePersisted({ ...s, brushSize } as AppState);
+      return { brushSize };
+    }),
+  beginErase: () => doc.beginStroke(),
+  eraseAt: (wx, wy) => {
+    doc.eraseCircle(wx, wy, get().brushSize / 2);
+    set({ docRev: doc.revision });
+  },
 
   params: {
     prompt: "",
@@ -266,19 +295,23 @@ export const useStore = create<AppState>((set, get) => ({
       await s.loadEngine();
       if (get().engineStatus !== "ready") return;
     }
-    if (!s.params.prompt.trim()) {
-      s.toast("error", "Describe what should appear in the frame first.");
+
+    const rect: Rect = { ...s.frame };
+    const known = doc.extract(rect);
+    // is there anything to outpaint/continue from?
+    let hasKnown = false;
+    for (let i = 3; i < known.data.length; i += 4)
+      if (known.data[i] > 8) { hasKnown = true; break; }
+
+    // A prompt is only required when there's nothing to continue from. With
+    // existing pixels in the frame, an empty prompt is a valid "just continue
+    // the scene" request (SD outpaints from the surrounding context).
+    if (!s.params.prompt.trim() && !hasKnown) {
+      s.toast("error", "Describe what should appear — or place/erase something to continue from.");
       return;
     }
     abortCtrl = new AbortController();
     set({ busy: true, progress: { phase: "encoding" } });
-
-    const rect: Rect = { ...s.frame };
-    const known = doc.extract(rect);
-    // is there anything to outpaint from?
-    let hasKnown = false;
-    for (let i = 3; i < known.data.length; i += 4)
-      if (known.data[i] > 8) { hasKnown = true; break; }
 
     try {
       const res = await provider.generate(
@@ -305,6 +338,68 @@ export const useStore = create<AppState>((set, get) => ({
   },
   cancel: () => {
     abortCtrl?.abort();
+  },
+
+  // Move the frame so it straddles the current content's edge in `dir` — most of
+  // it over EMPTY space (to be painted) with a band still covering existing
+  // pixels (so the model continues the scene instead of inventing a disconnected
+  // one). Then generate. This is the "press a button → the picture grows outward"
+  // action that makes outpainting actually feel like outpainting.
+  expand: async (dir) => {
+    const s = get();
+    if (s.busy) return;
+    const cb = doc.contentBounds();
+    // Nothing on the canvas yet → there's no edge to grow from; just paint here.
+    if (!cb) {
+      await s.generate();
+      return;
+    }
+    const f = s.frame;
+    const OVERLAP = 0.42; // fraction of the frame kept over existing content
+    const snap = (v: number) => Math.round(v / 8) * 8;
+    const cxC = cb.x + cb.w / 2;
+    const cyC = cb.y + cb.h / 2;
+    let x = f.x;
+    let y = f.y;
+    if (dir === "right") { x = snap(cb.x + cb.w - f.w * OVERLAP); y = snap(cyC - f.h / 2); }
+    else if (dir === "left") { x = snap(cb.x - f.w * (1 - OVERLAP)); y = snap(cyC - f.h / 2); }
+    else if (dir === "down") { y = snap(cb.y + cb.h - f.h * OVERLAP); x = snap(cxC - f.w / 2); }
+    else if (dir === "up") { y = snap(cb.y - f.h * (1 - OVERLAP)); x = snap(cxC - f.w / 2); }
+    set({ frame: { ...f, x, y } });
+    await get().generate();
+  },
+
+  captioning: false,
+  suggestPrompt: async () => {
+    const s = get();
+    if (s.captioning) return;
+    // Prefer what's inside the frame (that's what the user is continuing); fall
+    // back to the whole painted scene if the frame is empty.
+    const framed = doc.extract(s.frame);
+    let hasKnown = false;
+    for (let i = 3; i < framed.data.length; i += 4)
+      if (framed.data[i] > 8) { hasKnown = true; break; }
+    const src = hasKnown ? framed : doc.extractContent();
+    if (!src) {
+      s.toast("info", "Paint or place something first, then I can suggest a prompt to continue it.");
+      return;
+    }
+    set({ captioning: true });
+    try {
+      const text = await captionImage(src, (p) =>
+        set({ loadPct: p.fraction != null ? Math.round(p.fraction * 100) : get().loadPct }),
+      );
+      if (text) {
+        get().setParams({ prompt: text });
+        get().toast("success", "Suggested a prompt from the scene — tweak it or just Outpaint.");
+      } else {
+        get().toast("info", "Couldn't read a clear subject — try describing it yourself.");
+      }
+    } catch (e: unknown) {
+      get().toast("error", "Prompt suggestion failed: " + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      set({ captioning: false });
+    }
   },
 
   // ---- stamp: interactive photo placement -------------------------------
@@ -426,4 +521,5 @@ export type { ProviderId };
 // Dev/testing handle so automation can drive canvas state deterministically.
 if (typeof window !== "undefined") {
   (window as unknown as { vellumStore?: typeof useStore }).vellumStore = useStore;
+  (window as unknown as { vellumDoc?: typeof doc }).vellumDoc = doc;
 }

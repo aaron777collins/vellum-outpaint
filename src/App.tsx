@@ -50,6 +50,17 @@ export default function App() {
         else generate();
       } else if (e.key === "Escape" && busy) {
         cancel();
+      } else if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === "[" || e.key === "]")) {
+        // resize the erase brush
+        const st = useStore.getState();
+        if (st.tool === "erase") {
+          e.preventDefault();
+          st.setBrushSize(st.brushSize + (e.key === "]" ? 12 : -12));
+        }
+      } else if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === "e") {
+        useStore.getState().setTool("erase");
+      } else if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key.toLowerCase() === "b" || e.key.toLowerCase() === "v")) {
+        useStore.getState().setTool("frame");
       }
     };
     window.addEventListener("keydown", onKey);

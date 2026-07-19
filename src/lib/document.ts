@@ -113,6 +113,46 @@ export class VellumDocument {
     this.revision++;
   }
 
+  /**
+   * Begin a user edit stroke: snapshot current state for undo ONCE, so a whole
+   * drag (many erase dabs) collapses to a single undo step. Call at pointer-down.
+   */
+  beginStroke() {
+    this.pushUndo();
+  }
+
+  /**
+   * Erase a soft-edged circle at a WORLD point — makes those pixels transparent
+   * (alpha 0) so the next generate treats them as "unknown" and repaints them
+   * (inpaint). The radial falloff feathers the erased edge so the regenerated
+   * fill blends instead of leaving a hard disc. No undo push here: the caller
+   * runs beginStroke() once per drag so an entire stroke is one undo step.
+   */
+  eraseCircle(wx: number, wy: number, radius: number) {
+    const r = Math.max(1, radius);
+    const [cx, cy] = this.worldToCanvas(wx, wy);
+    const ctx = ctxOf(this.world);
+    ctx.save();
+    ctx.globalCompositeOperation = "destination-out";
+    const g = ctx.createRadialGradient(cx, cy, r * 0.5, cx, cy, r);
+    g.addColorStop(0, "rgba(0,0,0,1)");
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    this.revision++;
+  }
+
+  /** Tight content-bounds pixels (opaque region), or null if empty. Used to
+   *  give the auto-prompt captioner the actual painted scene, not the padding. */
+  extractContent(): ImageData | null {
+    const cb = this.contentBounds();
+    if (!cb) return null;
+    return this.extract(cb);
+  }
+
   /** Place an imported image, centered at a world point. */
   place(img: ImageData, centerX: number, centerY: number) {
     const rect: Rect = {

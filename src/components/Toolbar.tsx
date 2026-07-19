@@ -4,6 +4,7 @@ import { pickImageFile } from "../lib/imaging";
 
 const TOOLS: { id: Tool; glyph: string; label: string }[] = [
   { id: "frame", glyph: "▣", label: "Frame — position the outpaint window" },
+  { id: "erase", glyph: "⌫", label: "Erase — brush pixels away, then Outpaint to repaint them ([ ] resize)" },
   { id: "pan", glyph: "✥", label: "Pan — drag the canvas (or hold Shift)" },
 ];
 

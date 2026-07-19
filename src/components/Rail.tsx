@@ -38,8 +38,15 @@ export default function Rail() {
   const setFrame = useStore((s) => s.setFrame);
   const frame = useStore((s) => s.frame);
   const generate = useStore((s) => s.generate);
+  const expand = useStore((s) => s.expand);
   const cancel = useStore((s) => s.cancel);
   const busy = useStore((s) => s.busy);
+  const suggestPrompt = useStore((s) => s.suggestPrompt);
+  const captioning = useStore((s) => s.captioning);
+  const tool = useStore((s) => s.tool);
+  const setTool = useStore((s) => s.setTool);
+  const brushSize = useStore((s) => s.brushSize);
+  const setBrushSize = useStore((s) => s.setBrushSize);
   const engineId = useStore((s) => s.engineId);
   const setEngine = useStore((s) => s.setEngine);
   const engineStatus = useStore((s) => s.engineStatus);
@@ -96,10 +103,18 @@ export default function Rail() {
         <section className="panel">
           <div className="panel-title">
             <span className="eyebrow">The vision</span>
+            <button
+              className="suggest-btn"
+              onClick={() => suggestPrompt()}
+              disabled={captioning}
+              title="Read the current scene and suggest a prompt to continue it (small model downloads once)"
+            >
+              {captioning ? "reading…" : "✦ suggest"}
+            </button>
           </div>
           <textarea
             className="prompt"
-            placeholder="a windswept coastline at golden hour, distant lighthouse, painterly…"
+            placeholder="a windswept coastline at golden hour, distant lighthouse, painterly… — or leave blank to just continue the scene"
             value={params.prompt}
             onChange={(e) => setParams({ prompt: e.target.value })}
             rows={4}
@@ -138,6 +153,52 @@ export default function Rail() {
               </button>
             ))}
           </div>
+        </section>
+
+        {/* ---- expand (one-click directional outpaint) ---- */}
+        <section className="panel">
+          <div className="panel-title">
+            <span className="eyebrow">Expand</span>
+          </div>
+          <div className="expand-pad">
+            <button className="expand-btn up" disabled={busy} title="Extend upward" onClick={() => expand("up")}>↑</button>
+            <button className="expand-btn left" disabled={busy} title="Extend left" onClick={() => expand("left")}>←</button>
+            <span className="expand-core">grow</span>
+            <button className="expand-btn right" disabled={busy} title="Extend right" onClick={() => expand("right")}>→</button>
+            <button className="expand-btn down" disabled={busy} title="Extend downward" onClick={() => expand("down")}>↓</button>
+          </div>
+          <div className="hint" style={{ marginBottom: 0 }}>
+            Snaps the frame onto the edge and paints the scene onward.
+          </div>
+        </section>
+
+        {/* ---- retouch / erase ---- */}
+        <section className="panel">
+          <div className="panel-title">
+            <span className="eyebrow">Retouch</span>
+            <button
+              className={`mini-toggle inline ${tool === "erase" ? "on" : ""}`}
+              onClick={() => setTool(tool === "erase" ? "frame" : "erase")}
+            >
+              {tool === "erase" ? "erasing" : "eraser"}
+            </button>
+          </div>
+          {tool === "erase" ? (
+            <>
+              <Slider
+                label="Brush size" value={brushSize} min={16} max={512} step={4}
+                onChange={(v) => setBrushSize(v)}
+                fmt={(v) => `${Math.round(v)} px`}
+              />
+              <div className="hint" style={{ marginBottom: 0 }}>
+                Drag on the canvas to erase · then Outpaint repaints those areas.
+              </div>
+            </>
+          ) : (
+            <div className="hint" style={{ marginBottom: 0 }}>
+              Brush away a spot, then Outpaint regenerates just that area.
+            </div>
+          )}
         </section>
 
         {/* ---- guidance sliders ---- */}
