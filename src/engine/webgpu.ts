@@ -19,6 +19,7 @@
 
 import * as ort from "onnxruntime-web/webgpu";
 import {
+  buildLatentMask,
   buildOutpaintInit,
   compositeFeathered,
 } from "../lib/imaging";
@@ -883,95 +884,105 @@ export class WebGpuProvider implements DiffusionProvider {
     const knownAtSize = req.initImage ? resizeImageData(req.initImage, size, size) : null;
     const isImg = !!(req.initImage && knownAtSize);
 
-    let latent: Float32Array;
-    let finalLatent: Float32Array;
-
-    if (this.manifest.turbo) {
-      // ---- single-step turbo path ----
-      let sigma: number;
-      const n = 4 * L * L;
-      let z: Float32Array | null = null;
-      if (isImg && knownAtSize) {
-        const { init } = buildOutpaintInit(knownAtSize, seed);
-        onProgress({ phase: "encoding", detail: "vae", fraction: 0.25 });
-        z = await this.encodeInitLatent(init, L, onProgress, signal);
-      }
-      if (z) {
-        // img2img: noise the encoded latent by `strength`.
-        sigma = Math.max(0.05, req.strength) * SIGMA_MAX;
-        const noise = seededGaussian(z.length, seed);
-        latent = new Float32Array(z.length);
-        for (let i = 0; i < z.length; i++) latent[i] = z[i] + sigma * noise[i];
-      } else {
-        // txt2img, or img2img whose fp16 encode overflowed — seed from full noise.
-        // The feathered composite still blends the real photo back at the seam.
-        sigma = SIGMA_MAX;
-        const noise = seededGaussian(n, seed);
-        latent = new Float32Array(n);
-        for (let i = 0; i < n; i++) latent[i] = noise[i] * sigma;
-      }
-      check();
-      onProgress({ phase: "sampling", step: 1, totalSteps: 1, fraction: 0.6, detail: "1 step (turbo)" });
-      const cin = 1 / Math.sqrt(sigma * sigma + 1);
-      const scaled = new Float32Array(latent.length);
-      for (let i = 0; i < latent.length; i++) scaled[i] = latent[i] * cin;
-      const eps = await this.runUnet(scaled, TURBO_TIMESTEP, hidden, L, signal);
-      finalLatent = new Float32Array(latent.length);
-      for (let i = 0; i < latent.length; i++) finalLatent[i] = latent[i] - sigma * eps[i];
-    } else {
-      // ---- multi-step Euler path (SD 1.5) ----
-      const steps = Math.max(2, Math.min(50, Math.round(req.steps) || 20));
-      const { sigmas, ts } = buildSchedule(steps);
-      let start = 0;
-      const n = 4 * L * L;
-      const noise = seededGaussian(n, seed);
-      let z: Float32Array | null = null;
-      if (isImg && knownAtSize) {
-        const { init } = buildOutpaintInit(knownAtSize, seed);
-        onProgress({ phase: "encoding", detail: "vae", fraction: 0.2 });
-        z = await this.encodeInitLatent(init, L, onProgress, signal);
-      }
-      if (z) {
-        // strength => how many of the later steps to run (denoise from noised z0)
-        start = Math.min(steps - 1, Math.max(0, Math.round((1 - req.strength) * steps)));
-        latent = new Float32Array(n);
-        for (let i = 0; i < n; i++) latent[i] = z[i] + sigmas[start] * noise[i];
-      } else {
-        // txt2img, or img2img whose fp16 encode overflowed — start from full noise.
-        start = 0;
-        latent = new Float32Array(n);
-        for (let i = 0; i < n; i++) latent[i] = noise[i] * sigmas[start];
-      }
-
-      const total = steps - start;
-      for (let i = start; i < steps; i++) {
-        check();
-        const sigma = sigmas[i];
-        const cin = 1 / Math.sqrt(sigma * sigma + 1);
-        const scaled = new Float32Array(latent.length);
-        for (let k = 0; k < latent.length; k++) scaled[k] = latent[k] * cin;
-        const tstep = ts[i];
-        const epsCond = await this.runUnet(scaled, tstep, hidden, L, signal);
-        let eps = epsCond;
-        if (useCfg && uncond) {
-          const epsUncond = await this.runUnet(scaled, tstep, uncond, L, signal);
-          eps = new Float32Array(epsCond.length);
-          for (let k = 0; k < eps.length; k++)
-            eps[k] = epsUncond[k] + req.guidance * (epsCond[k] - epsUncond[k]);
+    // ---- init latent + latent-space outpaint mask ------------------------
+    // Encode the edge-extended known tile to a latent we can LOCK in place, and
+    // build a mask marking the fresh (to-generate) region. Re-locking the known
+    // latent every sampling step is what makes the fresh region continue the
+    // scene (verified: without it the model denoises a whole new, unrelated tile
+    // — the "photos overlap, no blend" report). z0 is null only when the fp16
+    // VAE encoder overflowed; we then fall back to noise (txt2img) and still
+    // pixel-composite the real photo back at the seam.
+    const n = 4 * L * L;
+    let z0: Float32Array | null = null;
+    let mask: Float32Array | null = null; // [4·L·L], 1 = generate fresh, 0 = keep known
+    let anyUnknown = false;
+    let anyKnown = false;
+    if (isImg && knownAtSize) {
+      const { init } = buildOutpaintInit(knownAtSize, seed);
+      onProgress({ phase: "encoding", detail: "vae", fraction: 0.22 });
+      z0 = await this.encodeInitLatent(init, L, onProgress, signal);
+      if (z0) {
+        mask = buildLatentMask(knownAtSize, L);
+        for (let i = 0; i < L * L; i++) {
+          if (mask[i] > 0.02) anyUnknown = true;
+          else anyKnown = true;
+          if (anyUnknown && anyKnown) break;
         }
-        // Euler: d = eps; x += d * (sigma_next - sigma)
-        const dsig = sigmas[i + 1] - sigma;
-        for (let k = 0; k < latent.length; k++) latent[k] += eps[k] * dsig;
-        onProgress({
-          phase: "sampling",
-          step: i - start + 1,
-          totalSteps: total,
-          fraction: 0.15 + 0.7 * ((i - start + 1) / total),
-          detail: `step ${i - start + 1}/${total}`,
-        });
       }
-      finalLatent = latent;
     }
+    check();
+
+    const turbo = this.manifest.turbo;
+    const steps = turbo ? 1 : Math.max(2, Math.min(50, Math.round(req.steps) || 20));
+    const { sigmas, ts } = buildSchedule(steps);
+    const noise = seededGaussian(n, seed);
+
+    // An outpaint/inpaint (known pixels AND a fresh region) is driven by the
+    // mask, so it generates the fresh region fully (start at max sigma) while the
+    // lock preserves the surroundings. A plain img2img over a FULLY-known tile
+    // (no fresh region) has nothing to outpaint, so it honours `strength` the
+    // classic way. z0-less runs (txt2img / encode overflow) also start at max.
+    const outpaint = !!(z0 && mask && anyUnknown);
+    const plainImg2img = !!(z0 && !anyUnknown && anyKnown);
+    let start = 0;
+    if (plainImg2img) {
+      // Fraction of the sigma ladder to traverse. For turbo (1 step) we can't
+      // start partway, so approximate strength by scaling the single sigma below.
+      start = turbo ? 0 : Math.min(steps - 1, Math.max(0, Math.round((1 - req.strength) * steps)));
+    }
+    const startSigma =
+      plainImg2img && turbo ? Math.max(0.05, req.strength) * SIGMA_MAX : sigmas[start];
+
+    // Seed the latent. Outpaint & txt2img noise fully; plain img2img noises z0 by
+    // its start sigma. The known region (mask 0) is set to the re-noised true
+    // latent so step 1 already sees correct surroundings.
+    const latent = new Float32Array(n);
+    if (z0) for (let i = 0; i < n; i++) latent[i] = z0[i] + startSigma * noise[i];
+    else for (let i = 0; i < n; i++) latent[i] = noise[i] * startSigma;
+
+    const lockKnown = (sigma: number, toClean: boolean) => {
+      if (!outpaint || !z0 || !mask) return;
+      for (let k = 0; k < n; k++) {
+        const known = toClean ? z0[k] : z0[k] + sigma * noise[k];
+        latent[k] = mask[k] * latent[k] + (1 - mask[k]) * known;
+      }
+    };
+
+    const total = steps - start;
+    for (let i = start; i < steps; i++) {
+      check();
+      const sigma = turbo && plainImg2img ? startSigma : sigmas[i];
+      // Re-pin the known region to the true latent at this noise level before
+      // predicting, so the fresh region always denoises against real context.
+      lockKnown(sigma, false);
+      const cin = 1 / Math.sqrt(sigma * sigma + 1);
+      const scaled = new Float32Array(n);
+      for (let k = 0; k < n; k++) scaled[k] = latent[k] * cin;
+      const tstep = turbo ? TURBO_TIMESTEP : ts[i];
+      const epsCond = await this.runUnet(scaled, tstep, hidden, L, signal);
+      let eps = epsCond;
+      if (useCfg && uncond) {
+        const epsUncond = await this.runUnet(scaled, tstep, uncond, L, signal);
+        eps = new Float32Array(epsCond.length);
+        for (let k = 0; k < eps.length; k++)
+          eps[k] = epsUncond[k] + req.guidance * (epsCond[k] - epsUncond[k]);
+      }
+      // Euler step. For turbo (1 step) sigma_next is 0, so x = x - sigma·eps.
+      const dsig = (turbo && plainImg2img ? 0 : sigmas[i + 1]) - sigma;
+      for (let k = 0; k < n; k++) latent[k] += eps[k] * dsig;
+      onProgress({
+        phase: "sampling",
+        step: i - start + 1,
+        totalSteps: total,
+        fraction: 0.15 + 0.7 * ((i - start + 1) / total),
+        detail: turbo ? "1 step (turbo)" : `step ${i - start + 1}/${total}`,
+      });
+    }
+    // Final lock: pin the known region to the CLEAN encoded latent so the
+    // surroundings decode as the real scene (the pixel composite then restores
+    // them exactly and feathers only the seam).
+    lockKnown(0, true);
+    const finalLatent = latent;
 
     check();
     // Pre-decode guard: a NaN-poisoned or flat latent will only ever decode to a

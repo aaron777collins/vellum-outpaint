@@ -45,6 +45,54 @@ export function canvasToImageData(c: HTMLCanvasElement): ImageData {
 }
 
 /**
+ * Latent-space outpaint mask, downsampled from the known tile's alpha channel.
+ * Each latent cell corresponds to an 8×8 pixel block; the value is the fraction
+ * of that block that is UNKNOWN (to be generated): 1 = fully fresh, 0 = fully
+ * known. Returned flattened to [4·L·L] (broadcast across the 4 latent channels)
+ * so it can multiply a latent directly.
+ *
+ * This is the key to real outpainting: during sampling the known latent is
+ * re-locked every step wherever this mask is 0, so the model always sees the
+ * true surroundings as fixed context and grows the fresh region to CONTINUE the
+ * scene — instead of denoising a whole new, unrelated tile. `known` must already
+ * be at latent-pixel resolution (L·8 square).
+ */
+export function buildLatentMask(known: ImageData, L: number): Float32Array {
+  const size = L * 8;
+  const src =
+    known.width === size && known.height === size
+      ? known
+      : resizeImageDataLocal(known, size, size);
+  const per = new Float32Array(L * L);
+  for (let ly = 0; ly < L; ly++) {
+    for (let lx = 0; lx < L; lx++) {
+      let unknown = 0;
+      for (let dy = 0; dy < 8; dy++) {
+        for (let dx = 0; dx < 8; dx++) {
+          const x = lx * 8 + dx;
+          const y = ly * 8 + dy;
+          if (src.data[(y * size + x) * 4 + 3] <= 8) unknown++;
+        }
+      }
+      per[ly * L + lx] = unknown / 64;
+    }
+  }
+  const m = new Float32Array(4 * L * L);
+  for (let c = 0; c < 4; c++) for (let i = 0; i < L * L; i++) m[c * L * L + i] = per[i];
+  return m;
+}
+
+/** Canvas-backed resize kept local so buildLatentMask has no import cycle. */
+function resizeImageDataLocal(img: ImageData, w: number, h: number): ImageData {
+  const src = imageDataToCanvas(img);
+  const c = makeCanvas(w, h);
+  const ctx = ctxOf(c);
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(src, 0, 0, w, h);
+  return ctx.getImageData(0, 0, w, h);
+}
+
+/**
  * Build the init tile for an outpaint: existing pixels are copied in, and any
  * area with zero alpha (the fresh expanse) is filled by mirror-extending the
  * nearest known edge, then lightly blurred + seeded-noised. This gives the
