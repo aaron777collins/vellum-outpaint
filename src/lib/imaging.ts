@@ -160,56 +160,69 @@ function boxBlurMasked(img: ImageData, keep: ImageData, radius: number): ImageDa
 }
 
 /**
- * Feathered mask for compositing: 255 where the pixel was freshly generated
- * (previously unknown), fading to 0 across `feather` px into the known region,
- * so the new tile melts into the old one.
+ * Blend weight for compositing a freshly-generated tile back onto the scene.
+ * Returns per-pixel alpha in [0,1] where 1 = use the generated pixel, 0 = keep
+ * the original known pixel:
+ *
+ *   • Unknown (transparent) pixels → 1: the fresh expanse is fully generated.
+ *   • Known pixels → a ramp from ~1 at the seam down to 0 once you're `feather`
+ *     px inside the existing image.
+ *
+ * The ramp is the whole point of outpainting: instead of butting the generated
+ * region hard against the original (a visible seam / "the photos just overlap"),
+ * the new pixels CROSS-FADE into the existing photo over a soft band, so the
+ * extension looks continuous. The weight is driven by each known pixel's
+ * distance to the nearest unknown pixel — i.e. how deep inside the real image it
+ * sits — computed with a two-pass chamfer distance transform.
  */
 export function featherMaskFromKnown(known: ImageData, feather: number): Float32Array {
   const { width: w, height: h } = known;
-  const m = new Float32Array(w * h);
-  // 1 where unknown (to be generated), 0 where known.
-  for (let i = 0, p = 3; i < m.length; i++, p += 4) {
-    m[i] = known.data[p] > 8 ? 0 : 1;
-  }
-  return featherField(m, w, h, feather);
-}
-
-/** Distance-based feather of a 0/1 field via separable min-cost sweep. */
-function featherField(field: Float32Array, w: number, h: number, feather: number): Float32Array {
   const f = Math.max(1, feather | 0);
-  const dist = new Float32Array(w * h).fill(Infinity);
-  // Seed: cells that are "known" (0) are distance 0.
-  for (let i = 0; i < field.length; i++) if (field[i] < 0.5) dist[i] = 0;
+  const n = w * h;
+  const INF = 1e9;
+
+  // dist = distance from each pixel to the nearest UNKNOWN (transparent) pixel.
+  // Seed 0 in the unknown region; it grows as we march into the known region.
+  const dist = new Float32Array(n);
+  for (let i = 0, p = 3; i < n; i++, p += 4) dist[i] = known.data[p] > 8 ? INF : 0;
+
   const relax = (i: number, j: number, cost: number) => {
     if (dist[j] + cost < dist[i]) dist[i] = dist[j] + cost;
   };
-  // forward
+  // forward pass (top-left → bottom-right)
   for (let y = 0; y < h; y++)
     for (let x = 0; x < w; x++) {
       const i = y * w + x;
+      if (dist[i] === 0) continue;
       if (x > 0) relax(i, i - 1, 1);
       if (y > 0) relax(i, i - w, 1);
       if (x > 0 && y > 0) relax(i, i - w - 1, 1.4142);
+      if (x < w - 1 && y > 0) relax(i, i - w + 1, 1.4142);
     }
-  // backward
+  // backward pass (bottom-right → top-left)
   for (let y = h - 1; y >= 0; y--)
     for (let x = w - 1; x >= 0; x--) {
       const i = y * w + x;
+      if (dist[i] === 0) continue;
       if (x < w - 1) relax(i, i + 1, 1);
       if (y < h - 1) relax(i, i + w, 1);
       if (x < w - 1 && y < h - 1) relax(i, i + w + 1, 1.4142);
+      if (x > 0 && y < h - 1) relax(i, i + w - 1, 1.4142);
     }
-  const out = new Float32Array(w * h);
-  for (let i = 0; i < out.length; i++) {
-    if (field[i] < 0.5) out[i] = 0;
-    else out[i] = Math.min(1, dist[i] / f);
+
+  const alpha = new Float32Array(n);
+  for (let i = 0, p = 3; i < n; i++, p += 4) {
+    // Unknown → fully generated. Known → fade generated out over `feather` px.
+    alpha[i] = known.data[p] > 8 ? Math.max(0, 1 - dist[i] / f) : 1;
   }
-  return out;
+  return alpha;
 }
 
 /**
- * Composite a generated tile over the known tile using a feathered alpha so the
- * fresh region is fully painted and the boundary is a smooth ramp.
+ * Composite a generated tile over the known tile using the feathered weight from
+ * `featherMaskFromKnown`, so the fresh region is fully painted and cross-fades
+ * smoothly into the existing image across the seam (no hard overlap boundary).
+ * `known` and `generated` must share dimensions.
  */
 export function compositeFeathered(
   known: ImageData,
@@ -221,14 +234,13 @@ export function compositeFeathered(
   const out = new ImageData(w, h);
   const k = known.data, g = generated.data, o = out.data;
   for (let i = 0, p = 0; i < alpha.length; i++, p += 4) {
-    const a = alpha[i]; // 1 => use generated, 0 => keep known
+    const a = alpha[i]; // 1 => generated, 0 => known
     const ia = 1 - a;
-    // where known is transparent, force generated
-    const ka = k[p + 3] > 8 ? ia : 0;
-    const ga = 1 - ka;
-    o[p] = Math.round(g[p] * ga + k[p] * ka);
-    o[p + 1] = Math.round(g[p + 1] * ga + k[p + 1] * ka);
-    o[p + 2] = Math.round(g[p + 2] * ga + k[p + 2] * ka);
+    // Where known is transparent, alpha is 1 (see featherMaskFromKnown), so the
+    // transparent RGB never leaks in — a plain lerp is correct everywhere.
+    o[p] = Math.round(g[p] * a + k[p] * ia);
+    o[p + 1] = Math.round(g[p + 1] * a + k[p + 1] * ia);
+    o[p + 2] = Math.round(g[p + 2] * a + k[p + 2] * ia);
     o[p + 3] = 255;
   }
   return out;
